@@ -82,6 +82,17 @@ unsigned long huge_anon_orders_madvise __read_mostly;
 unsigned long huge_anon_orders_inherit __read_mostly;
 static bool anon_orders_configured __initdata;
 
+/*
+ * Pluggable mTHP order selection hook — see include/linux/huge_mm.h.
+ * Modules register by storing a function pointer with WRITE_ONCE and
+ * must call synchronize_rcu() before unloading.
+ */
+unsigned long (*mthp_order_filter_fn)(struct vm_area_struct *vma,
+				      vm_flags_t vm_flags,
+				      enum tva_type type,
+				      unsigned long orders) __read_mostly;
+EXPORT_SYMBOL(mthp_order_filter_fn);
+
 static inline bool file_thp_enabled(struct vm_area_struct *vma)
 {
 	struct inode *inode;
@@ -213,8 +224,22 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 	 * the first page fault.
 	 */
 	if (!vma->anon_vma)
-		return (smaps || in_pf) ? orders : 0;
+		orders = (smaps || in_pf) ? orders : 0;
 
+	/*
+	 * Invoke pluggable order selection policy (e.g. mthp_bestfit).
+	 * Skipped for TVA_SMAPS (must reflect true kernel policy for
+	 * /proc/PID/smaps) and TVA_FORCED_COLLAPSE (explicit user intent
+	 * via MADV_COLLAPSE that must not be second-guessed).
+	 */
+	if (orders && type != TVA_SMAPS && type != TVA_FORCED_COLLAPSE) {
+		unsigned long (*fn)(struct vm_area_struct *, vm_flags_t,
+				    enum tva_type, unsigned long);
+
+		fn = READ_ONCE(mthp_order_filter_fn);
+		if (fn)
+			orders = fn(vma, vm_flags, type, orders);
+	}
 	return orders;
 }
 
