@@ -963,30 +963,6 @@ config NO_PAGE_MAPCOUNT
 
 	  EXPERIMENTAL because the impact of some changes is still unclear.
 
-config MTHP_BESTFIT
-	tristate "VMA-size best-fit mTHP order selection"
-	depends on TRANSPARENT_HUGEPAGE && KPROBES
-	help
-	  Loadable module that intercepts __thp_vma_allowable_orders() via
-	  kretprobe and applies VMA-size-aware order masking.
-
-	  The baseline kernel uses a greedy highest-order-first strategy that
-	  can waste allocation attempts on orders too large to fit in a given
-	  VMA.  This module computes the largest order where at least
-	  min_pages complete aligned hugepages fit within the faulting VMA
-	  and masks out larger orders before the allocator even tries them.
-
-	  Additional policies:
-	    - Stack VMAs (VM_GROWSDOWN): order capped at 2 (16 KB)
-	    - File+exec VMAs: optional +1 order boost for iTLB pressure
-	    - TVA_SMAPS and TVA_FORCED_COLLAPSE calls: not intercepted
-	    - dry_run sysctl: count decisions without altering return values
-
-	  Tunable at runtime via /proc/sys/vm/mthp_bestfit_*.
-	  Statistics available at /sys/kernel/debug/mthp_bestfit/stats.
-
-	  If unsure, say M.
-
 endif # TRANSPARENT_HUGEPAGE
 
 # simple helper to make the code a bit easier to read
