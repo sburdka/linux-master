@@ -965,6 +965,33 @@ config NO_PAGE_MAPCOUNT
 
 endif # TRANSPARENT_HUGEPAGE
 
+config MTHP_BESTFIT
+	bool "mTHP best-fit VMA-size-aware order selection"
+	depends on TRANSPARENT_HUGEPAGE
+	default y
+	help
+	  Integrates a six-step policy directly into __thp_vma_allowable_orders()
+	  to replace the greedy highest-order-first baseline:
+
+	    1. Geometric best-fit  — largest order N where min_pages aligned
+	       hugepages fit between ALIGN(vm_start, page_size) and vm_end
+	    2. Stack cap           — VM_GROWSDOWN capped at order 2 (16 KB)
+	    3. Exec boost          — VM_EXEC + vm_file promoted +1 (iTLB)
+	    4. Pressure limit      — require >= pressure_min_free free buddy
+	       blocks; closes the snapshot-to-allocation race window that
+	       causes residual compact_stall events
+	    5. NUMA locality       — prefer orders the local node can serve
+	    6. Lifetime conservation — new VMA (anon_vma == NULL) demoted by 1
+
+	  When disabled (n), the original pluggable mthp_order_filter_fn
+	  function pointer hook is compiled in so out-of-tree modules can
+	  still install a custom policy.
+
+	  Tunables: /proc/sys/vm/mthp_bestfit_*
+	  Stats:    /sys/kernel/debug/mthp_bestfit_stats
+
+	  If unsure, say Y.
+
 # simple helper to make the code a bit easier to read
 config PAGE_MAPCOUNT
 	def_bool !NO_PAGE_MAPCOUNT

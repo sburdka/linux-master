@@ -84,21 +84,26 @@ unsigned long huge_anon_orders_madvise __read_mostly;
 unsigned long huge_anon_orders_inherit __read_mostly;
 static bool anon_orders_configured __initdata;
 
+#ifdef CONFIG_MTHP_BESTFIT
 /* =========================================================================
- * mTHP best-fit order selection — in-tree policy
+ * mTHP best-fit order selection — in-tree policy (CONFIG_MTHP_BESTFIT=y)
  *
- * Eliminates the pluggable function-pointer hook in favour of a direct
- * call from __thp_vma_allowable_orders().  Six-step policy pipeline:
+ * Replaces the pluggable mthp_order_filter_fn function pointer with a
+ * direct call from __thp_vma_allowable_orders().  Six-step pipeline:
  *
  *  1. Geometric best-fit  — largest N where min_pages aligned hugepages fit
  *  2. Stack cap           — VM_GROWSDOWN capped at order 2 (16 KB)
  *  3. Exec boost          — VM_EXEC + vm_file promoted +1 order (iTLB)
- *  4. Pressure limit      — require ≥ pressure_min_free free buddy blocks
+ *  4. Pressure limit      — require >= pressure_min_free free buddy blocks
  *  5. NUMA locality       — prefer local-node satisfiable orders
  *  6. Lifetime conservation — new VMA (anon_vma == NULL) demoted by 1
  *
  * Tunables: /proc/sys/vm/mthp_bestfit_*
  * Stats:    /sys/kernel/debug/mthp_bestfit_stats
+ * =========================================================================
+ * When CONFIG_MTHP_BESTFIT=n the original mthp_order_filter_fn function
+ * pointer is compiled in instead, allowing out-of-tree modules to install
+ * a custom policy via WRITE_ONCE(mthp_order_filter_fn, ...).
  * ========================================================================= */
 
 /* ---- Sysctl knobs -------------------------------------------------------- */
@@ -527,7 +532,22 @@ static int mthp_bestfit_stats_show(struct seq_file *m, void *v)
 DEFINE_SHOW_ATTRIBUTE(mthp_bestfit_stats);
 #endif /* CONFIG_DEBUG_FS */
 
-/* ---- end mthp_bestfit ---------------------------------------------------- */
+/* ---- end mthp_bestfit (CONFIG_MTHP_BESTFIT=y) ---------------------------- */
+
+#else /* !CONFIG_MTHP_BESTFIT — original pluggable function pointer hook */
+
+/*
+ * mthp_order_filter_fn: out-of-tree modules register here via WRITE_ONCE.
+ * Called at the end of __thp_vma_allowable_orders() for TVA_PAGEFAULT and
+ * TVA_KHUGEPAGED.  Callers must call synchronize_rcu() before unloading.
+ */
+unsigned long (*mthp_order_filter_fn)(struct vm_area_struct *vma,
+				      vm_flags_t vm_flags,
+				      enum tva_type type,
+				      unsigned long orders) __read_mostly;
+EXPORT_SYMBOL(mthp_order_filter_fn);
+
+#endif /* CONFIG_MTHP_BESTFIT */
 
 static inline bool file_thp_enabled(struct vm_area_struct *vma)
 {
@@ -663,12 +683,22 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 		orders = (smaps || in_pf) ? orders : 0;
 
 	/*
-	 * Apply bestfit order selection.  Skipped for TVA_SMAPS (must show
-	 * true kernel policy in /proc/PID/smaps) and TVA_FORCED_COLLAPSE
-	 * (explicit MADV_COLLAPSE intent must not be second-guessed).
+	 * Order selection policy.  Skipped for TVA_SMAPS (must show true
+	 * kernel policy in /proc/PID/smaps) and TVA_FORCED_COLLAPSE (explicit
+	 * MADV_COLLAPSE intent must not be second-guessed by any policy).
 	 */
-	if (orders && type != TVA_SMAPS && type != TVA_FORCED_COLLAPSE)
+	if (orders && type != TVA_SMAPS && type != TVA_FORCED_COLLAPSE) {
+#ifdef CONFIG_MTHP_BESTFIT
 		orders = mthp_bestfit_apply(vma, vm_flags, type, orders);
+#else
+		unsigned long (*fn)(struct vm_area_struct *, vm_flags_t,
+				    enum tva_type, unsigned long);
+
+		fn = READ_ONCE(mthp_order_filter_fn);
+		if (fn)
+			orders = fn(vma, vm_flags, type, orders);
+#endif
+	}
 	return orders;
 }
 
@@ -1459,8 +1489,10 @@ static int __init hugepage_init(void)
 	if (err)
 		goto err_khugepaged;
 
+#ifdef CONFIG_MTHP_BESTFIT
 	if (!register_sysctl("vm", mthp_bestfit_sysctls))
 		pr_warn("mthp_bestfit: sysctl registration failed\n");
+#endif
 
 	return 0;
 err_khugepaged:
@@ -5425,8 +5457,10 @@ static int __init split_huge_pages_debugfs(void)
 {
 	debugfs_create_file("split_huge_pages", 0200, NULL, NULL,
 			    &split_huge_pages_fops);
+#ifdef CONFIG_MTHP_BESTFIT
 	debugfs_create_file("mthp_bestfit_stats", 0444, NULL, NULL,
 			    &mthp_bestfit_stats_fops);
+#endif
 	return 0;
 }
 late_initcall(split_huge_pages_debugfs);

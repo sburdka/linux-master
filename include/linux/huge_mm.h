@@ -271,6 +271,23 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 					 unsigned long orders);
 
 /**
+ * mthp_order_filter_fn - pluggable mTHP order selection hook (CONFIG_MTHP_BESTFIT=n)
+ *
+ * Available when CONFIG_MTHP_BESTFIT is disabled.  When non-NULL, called at
+ * the end of __thp_vma_allowable_orders() so an out-of-tree module can
+ * install a custom order-selection policy without rebuilding the kernel.
+ *
+ * Must return a subset of @orders.  Must not sleep.
+ * Writers: WRITE_ONCE + synchronize_rcu() before unloading.
+ */
+#ifndef CONFIG_MTHP_BESTFIT
+extern unsigned long (*mthp_order_filter_fn)(struct vm_area_struct *vma,
+					     vm_flags_t vm_flags,
+					     enum tva_type type,
+					     unsigned long orders);
+#endif
+
+/**
  * thp_vma_allowable_orders - determine hugepage orders that are allowed for vma
  * @vma:  the vm area to check
  * @vm_flags: use these vm_flags instead of vma->vm_flags
