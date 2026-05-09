@@ -271,26 +271,6 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 					 unsigned long orders);
 
 /**
- * mthp_order_filter_fn - pluggable mTHP order selection hook
- *
- * When non-NULL, called at the end of __thp_vma_allowable_orders() to
- * allow a policy module to further restrict the allowed order bitmask
- * based on VMA geometry, system memory pressure, or NUMA topology.
- *
- * Called with the kernel's policy-filtered bitmask.  Must return a
- * subset of @orders (may not add new orders).  Must not sleep.
- * Readers use READ_ONCE; writers must use WRITE_ONCE + synchronize_rcu().
- *
- * Not invoked for TVA_SMAPS (diagnostic) or TVA_FORCED_COLLAPSE
- * (explicit user intent via MADV_COLLAPSE) — those callers always
- * receive the kernel's unmodified answer.
- */
-extern unsigned long (*mthp_order_filter_fn)(struct vm_area_struct *vma,
-					     vm_flags_t vm_flags,
-					     enum tva_type type,
-					     unsigned long orders);
-
-/**
  * thp_vma_allowable_orders - determine hugepage orders that are allowed for vma
  * @vma:  the vm area to check
  * @vm_flags: use these vm_flags instead of vma->vm_flags

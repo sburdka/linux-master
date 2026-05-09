@@ -1604,6 +1604,7 @@ void touch_pud(struct vm_area_struct *vma, unsigned long addr,
 	       pud_t *pud, bool write);
 bool touch_pmd(struct vm_area_struct *vma, unsigned long addr,
 	       pmd_t *pmd, bool write);
+bool thp_bestfit_suppress_pmd(struct vm_area_struct *vma);
 
 /*
  * Parses a string with mem suffixes into its order. Useful to parse kernel

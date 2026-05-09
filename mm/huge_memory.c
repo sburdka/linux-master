@@ -33,6 +33,8 @@
 #include <linux/shmem_fs.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
+#include <linux/topology.h>
+#include <linux/sysctl.h>
 #include <linux/page_owner.h>
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
@@ -82,16 +84,450 @@ unsigned long huge_anon_orders_madvise __read_mostly;
 unsigned long huge_anon_orders_inherit __read_mostly;
 static bool anon_orders_configured __initdata;
 
+/* =========================================================================
+ * mTHP best-fit order selection — in-tree policy
+ *
+ * Eliminates the pluggable function-pointer hook in favour of a direct
+ * call from __thp_vma_allowable_orders().  Six-step policy pipeline:
+ *
+ *  1. Geometric best-fit  — largest N where min_pages aligned hugepages fit
+ *  2. Stack cap           — VM_GROWSDOWN capped at order 2 (16 KB)
+ *  3. Exec boost          — VM_EXEC + vm_file promoted +1 order (iTLB)
+ *  4. Pressure limit      — require ≥ pressure_min_free free buddy blocks
+ *  5. NUMA locality       — prefer local-node satisfiable orders
+ *  6. Lifetime conservation — new VMA (anon_vma == NULL) demoted by 1
+ *
+ * Tunables: /proc/sys/vm/mthp_bestfit_*
+ * Stats:    /sys/kernel/debug/mthp_bestfit_stats
+ * ========================================================================= */
+
+/* ---- Sysctl knobs -------------------------------------------------------- */
+static int bf_enabled          __read_mostly = 1;
+static int bf_min_pages        __read_mostly = 2;
+static int bf_exec_boost       __read_mostly = 1;
+static int bf_dry_run          __read_mostly = 0;
+static int bf_pressure_aware   __read_mostly = 1;
 /*
- * Pluggable mTHP order selection hook — see include/linux/huge_mm.h.
- * Modules register by storing a function pointer with WRITE_ONCE and
- * must call synchronize_rcu() before unloading.
+ * bf_pressure_min_free: number of free buddy blocks required at the target
+ * order before committing to it.  A buffer > 1 guards the race window
+ * between our free_area[] snapshot and the actual vma_alloc_folio() call,
+ * which is the primary source of residual compact_stall events in mTHP
+ * workloads.  Default 4 = require four free blocks.
  */
-unsigned long (*mthp_order_filter_fn)(struct vm_area_struct *vma,
-				      vm_flags_t vm_flags,
-				      enum tva_type type,
-				      unsigned long orders) __read_mostly;
-EXPORT_SYMBOL(mthp_order_filter_fn);
+static int bf_pressure_min_free __read_mostly = 4;
+static int bf_numa_aware       __read_mostly = 1;
+static int bf_lifetime_aware   __read_mostly = 1;
+
+static int bf_max_min_pages     = 16;
+static int bf_max_pressure_free = 64;
+
+/* ---- Per-CPU counters ---------------------------------------------------- */
+#define BF_VMA_STACK  0	/* VM_GROWSDOWN */
+#define BF_VMA_EXEC   1	/* VM_EXEC | vm_file (ELF .text) */
+#define BF_VMA_ANON   2	/* anonymous heap/mmap */
+#define BF_VMA_FILE   3	/* file-backed, non-exec */
+#define BF_VMA_TYPES  4
+
+struct bf_counters {
+	u64 decisions;
+	u64 suppressed;
+	u64 pressure_downgraded;
+	u64 numa_downgraded;
+	u64 lifetime_conserved;
+	u64 compact_stall_avoided;
+	u64 order_hist[PMD_ORDER + 1];
+	u64 by_type[BF_VMA_TYPES];
+};
+
+static DEFINE_PER_CPU(struct bf_counters, mthp_bf_pcpu);
+
+static int bf_vma_type(const struct vm_area_struct *vma)
+{
+	if (vma->vm_flags & VM_GROWSDOWN)
+		return BF_VMA_STACK;
+	if ((vma->vm_flags & VM_EXEC) && vma->vm_file)
+		return BF_VMA_EXEC;
+	if (vma_is_anonymous(vma))
+		return BF_VMA_ANON;
+	return BF_VMA_FILE;
+}
+
+static void bf_count(int order, int vtype, bool suppressed, bool pdg,
+		     bool ndg, bool lc, bool sa)
+{
+	struct bf_counters *c;
+
+	preempt_disable();
+	c = this_cpu_ptr(&mthp_bf_pcpu);
+	c->decisions++;
+	if (suppressed) c->suppressed++;
+	if (pdg)        c->pressure_downgraded++;
+	if (ndg)        c->numa_downgraded++;
+	if (lc)         c->lifetime_conserved++;
+	if (sa)         c->compact_stall_avoided++;
+	if (order >= 0 && order <= PMD_ORDER)
+		c->order_hist[order]++;
+	if (vtype >= 0 && vtype < BF_VMA_TYPES)
+		c->by_type[vtype]++;
+	preempt_enable();
+}
+
+/* ---- Memory pressure helpers --------------------------------------------- */
+
+/*
+ * Racy read of nr_free — intentional heuristic snapshot.  If stale,
+ * the buddy allocator's own fallback path catches it.
+ */
+static unsigned long bf_order_free_count(int order)
+{
+	struct zone *zone;
+	unsigned long total = 0;
+
+	for_each_populated_zone(zone)
+		total += READ_ONCE(zone->free_area[order].nr_free);
+	return total;
+}
+
+static int bf_pressure_limit(int start, bool *stall_avoided)
+{
+	unsigned long free_count;
+	int min_free, order;
+
+	*stall_avoided = false;
+	if (!READ_ONCE(bf_pressure_aware))
+		return start;
+
+	min_free   = READ_ONCE(bf_pressure_min_free);
+	free_count = bf_order_free_count(start);
+	if (free_count >= (unsigned long)min_free)
+		return start;
+	if (free_count > 0)
+		*stall_avoided = true;
+
+	for (order = start - 1; order >= 2; order--)
+		if (bf_order_free_count(order) >= (unsigned long)min_free)
+			return order;
+	return 2;
+}
+
+static bool bf_order_local(int order)
+{
+	struct pglist_data *pgdat;
+	int nid, z;
+
+	if (!READ_ONCE(bf_numa_aware))
+		return true;
+
+	nid   = numa_node_id();
+	pgdat = NODE_DATA(nid);
+	for (z = 0; z < MAX_NR_ZONES; z++) {
+		struct zone *zone = &pgdat->node_zones[z];
+
+		if (!populated_zone(zone))
+			continue;
+		if (READ_ONCE(zone->free_area[order].nr_free) >=
+		    (unsigned long)READ_ONCE(bf_pressure_min_free))
+			return true;
+	}
+	return false;
+}
+
+/* ---- Core bestfit function ----------------------------------------------- */
+
+/*
+ * mthp_bestfit_apply - run the bestfit pipeline and return a filtered order mask.
+ *
+ * Called from __thp_vma_allowable_orders() for TVA_PAGEFAULT and
+ * TVA_KHUGEPAGED.  Returns a subset of @allowed_orders.
+ */
+static unsigned long mthp_bestfit_apply(struct vm_area_struct *vma,
+					vm_flags_t vm_flags,
+					enum tva_type type,
+					unsigned long allowed_orders)
+{
+	bool pdg = false, sa = false, ndg = false, lc = false;
+	unsigned long page_size, first_aligned, new_orders;
+	unsigned long min_pages;
+	int order, limited, vtype;
+	bool suppressed;
+
+	if (!READ_ONCE(bf_enabled))
+		return allowed_orders;
+
+	vtype     = bf_vma_type(vma);
+	min_pages = (unsigned long)READ_ONCE(bf_min_pages);
+
+	/* Step 1 + 2: Stack cap */
+	if (vma->vm_flags & VM_GROWSDOWN) {
+		page_size     = PAGE_SIZE << 2;
+		first_aligned = ALIGN(vma->vm_start, page_size);
+		if (first_aligned + page_size > vma->vm_end) {
+			bf_count(-1, vtype, true, false, false, false, false);
+			return 0;
+		}
+		bf_count(2, vtype, false, false, false, false, false);
+		return allowed_orders & ((1UL << 3) - 1);
+	}
+
+	/* Early exit: not even one aligned 16 KB region fits in VMA */
+	page_size     = PAGE_SIZE << 2;
+	first_aligned = ALIGN(vma->vm_start, page_size);
+	if (first_aligned + page_size > vma->vm_end) {
+		bf_count(-1, vtype, true, false, false, false, false);
+		return 0;
+	}
+
+	/* Step 2: Geometric best-fit — largest order where min_pages fit */
+	for (order = PMD_ORDER; order >= 2; order--) {
+		page_size     = 1UL << (PAGE_SHIFT + order);
+		first_aligned = ALIGN(vma->vm_start, page_size);
+		if (first_aligned < vma->vm_end &&
+		    (vma->vm_end - first_aligned) >= min_pages * page_size)
+			break;
+	}
+	if (order < 2) {
+		bf_count(-1, vtype, true, false, false, false, false);
+		return 0;
+	}
+
+	/* Step 3: Exec boost — widen iTLB coverage for ELF .text */
+	if ((vma->vm_flags & VM_EXEC) && vma->vm_file &&
+	    READ_ONCE(bf_exec_boost) && order < PMD_ORDER)
+		order++;
+
+	/* Step 4: Pressure limit */
+	limited = bf_pressure_limit(order, &sa);
+	if (limited < order) {
+		order = limited;
+		pdg   = true;
+	}
+
+	/* Step 5: NUMA locality — prefer orders the local node can serve */
+	if (!bf_order_local(order)) {
+		int o;
+
+		for (o = order - 1; o >= 2; o--) {
+			if (bf_order_local(o)) {
+				order = o;
+				ndg   = true;
+				break;
+			}
+		}
+	}
+
+	/* Step 6: Lifetime conservation — conserve blocks for new VMAs */
+	if (READ_ONCE(bf_lifetime_aware) && !vma->anon_vma && order > 2) {
+		order--;
+		lc = true;
+	}
+
+	new_orders = allowed_orders & ((1UL << (order + 1)) - 1);
+	suppressed = !new_orders;
+	bf_count(suppressed ? -1 : order, vtype, suppressed, pdg, ndg, lc, sa);
+
+	if (!READ_ONCE(bf_dry_run))
+		return new_orders;
+	return allowed_orders; /* dry_run: stats only */
+}
+
+/*
+ * thp_bestfit_suppress_pmd - should khugepaged skip this VMA entirely?
+ *
+ * Returns true if the bestfit policy would suppress PMD_ORDER collapse for
+ * @vma, allowing khugepaged to skip the full khugepaged_scan_pmd() cost.
+ */
+bool thp_bestfit_suppress_pmd(struct vm_area_struct *vma)
+{
+	unsigned long first_aligned;
+
+	if (!READ_ONCE(bf_enabled))
+		return false;
+
+	/* Geometric check: need at least min_pages aligned 2 MB pages */
+	first_aligned = ALIGN(vma->vm_start, HPAGE_PMD_SIZE);
+	if (first_aligned + (unsigned long)READ_ONCE(bf_min_pages) * HPAGE_PMD_SIZE >
+	    vma->vm_end)
+		return true;
+
+	/* Pressure check: skip if PMD blocks below threshold */
+	if (READ_ONCE(bf_pressure_aware) &&
+	    bf_order_free_count(PMD_ORDER) <
+	    (unsigned long)READ_ONCE(bf_pressure_min_free))
+		return true;
+
+	return false;
+}
+
+/* ---- Sysctl table -------------------------------------------------------- */
+
+static struct ctl_table mthp_bestfit_sysctls[] = {
+	{
+		.procname	= "mthp_bestfit_enabled",
+		.data		= &bf_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "mthp_bestfit_min_pages",
+		.data		= &bf_min_pages,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &bf_max_min_pages,
+	},
+	{
+		.procname	= "mthp_bestfit_exec_boost",
+		.data		= &bf_exec_boost,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "mthp_bestfit_dry_run",
+		.data		= &bf_dry_run,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "mthp_bestfit_pressure_aware",
+		.data		= &bf_pressure_aware,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "mthp_bestfit_pressure_min_free",
+		.data		= &bf_pressure_min_free,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &bf_max_pressure_free,
+	},
+	{
+		.procname	= "mthp_bestfit_numa_aware",
+		.data		= &bf_numa_aware,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "mthp_bestfit_lifetime_aware",
+		.data		= &bf_lifetime_aware,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+};
+
+/* ---- DebugFS stats ------------------------------------------------------- */
+
+#ifdef CONFIG_DEBUG_FS
+static const char * const bf_type_names[BF_VMA_TYPES] = {
+	[BF_VMA_STACK] = "stack",
+	[BF_VMA_EXEC]  = "exec",
+	[BF_VMA_ANON]  = "anon",
+	[BF_VMA_FILE]  = "file",
+};
+
+static int mthp_bestfit_stats_show(struct seq_file *m, void *v)
+{
+	struct bf_counters total = {};
+	int cpu, i;
+
+	for_each_possible_cpu(cpu) {
+		const struct bf_counters *c = per_cpu_ptr(&mthp_bf_pcpu, cpu);
+
+		total.decisions           += READ_ONCE(c->decisions);
+		total.suppressed          += READ_ONCE(c->suppressed);
+		total.pressure_downgraded += READ_ONCE(c->pressure_downgraded);
+		total.numa_downgraded     += READ_ONCE(c->numa_downgraded);
+		total.lifetime_conserved  += READ_ONCE(c->lifetime_conserved);
+		total.compact_stall_avoided += READ_ONCE(c->compact_stall_avoided);
+		for (i = 0; i <= PMD_ORDER; i++)
+			total.order_hist[i] += READ_ONCE(c->order_hist[i]);
+		for (i = 0; i < BF_VMA_TYPES; i++)
+			total.by_type[i] += READ_ONCE(c->by_type[i]);
+	}
+
+#define PCT(n) (total.decisions ? (n) * 100 / total.decisions : 0)
+
+	seq_puts(m, "mthp_bestfit — VMA-size best-fit mTHP order selection\n\n");
+
+	seq_puts(m, "Configuration\n");
+	seq_printf(m, "  enabled:            %d\n", bf_enabled);
+	seq_printf(m, "  min_pages:          %d\n", bf_min_pages);
+	seq_printf(m, "  exec_boost:         %d\n", bf_exec_boost);
+	seq_printf(m, "  dry_run:            %d\n", bf_dry_run);
+	seq_printf(m, "  pressure_aware:     %d\n", bf_pressure_aware);
+	seq_printf(m, "  pressure_min_free:  %d blocks\n", bf_pressure_min_free);
+	seq_printf(m, "  numa_aware:         %d\n", bf_numa_aware);
+	seq_printf(m, "  lifetime_aware:     %d\n", bf_lifetime_aware);
+
+	seq_puts(m, "\nDecision summary\n");
+	seq_printf(m, "  total:                  %llu\n", total.decisions);
+	seq_printf(m, "  suppressed (no mTHP):   %llu (%llu%%)\n",
+		   total.suppressed, PCT(total.suppressed));
+	seq_printf(m, "  pressure_downgraded:    %llu (%llu%%)\n",
+		   total.pressure_downgraded, PCT(total.pressure_downgraded));
+	seq_printf(m, "  compact_stall_avoided:  %llu (%llu%%)\n",
+		   total.compact_stall_avoided, PCT(total.compact_stall_avoided));
+	seq_printf(m, "  numa_downgraded:        %llu (%llu%%)\n",
+		   total.numa_downgraded, PCT(total.numa_downgraded));
+	seq_printf(m, "  lifetime_conserved:     %llu (%llu%%)\n",
+		   total.lifetime_conserved, PCT(total.lifetime_conserved));
+
+	seq_puts(m, "\nBy VMA type\n");
+	for (i = 0; i < BF_VMA_TYPES; i++)
+		seq_printf(m, "  %-6s : %llu (%llu%%)\n",
+			   bf_type_names[i],
+			   total.by_type[i], PCT(total.by_type[i]));
+
+	seq_puts(m, "\nOrder histogram (selected order)\n");
+	for (i = 2; i <= PMD_ORDER; i++) {
+		if (!total.order_hist[i])
+			continue;
+		seq_printf(m, "  order %2d (%6lu KB): %llu (%llu%%)\n",
+			   i, (PAGE_SIZE << i) >> 10,
+			   total.order_hist[i], PCT(total.order_hist[i]));
+	}
+
+	seq_puts(m, "\nTuning guide for compact_stall\n");
+	if (total.compact_stall_avoided > 0)
+		seq_printf(m,
+			   "  %llu potential stalls proactively avoided.\n"
+			   "  If compact_stall in /proc/vmstat is still rising,\n"
+			   "  increase pressure_min_free (currently %d).\n",
+			   total.compact_stall_avoided, bf_pressure_min_free);
+	else
+		seq_puts(m,
+			 "  0 stalls avoided — no race-window pressure detected.\n"
+			 "  If compact_stall is high, it comes from non-mTHP sources\n"
+			 "  (DMA, kmalloc, hugetlbfs) outside bestfit's scope.\n");
+
+#undef PCT
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(mthp_bestfit_stats);
+#endif /* CONFIG_DEBUG_FS */
+
+/* ---- end mthp_bestfit ---------------------------------------------------- */
 
 static inline bool file_thp_enabled(struct vm_area_struct *vma)
 {
@@ -227,19 +663,12 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 		orders = (smaps || in_pf) ? orders : 0;
 
 	/*
-	 * Invoke pluggable order selection policy (e.g. mthp_bestfit).
-	 * Skipped for TVA_SMAPS (must reflect true kernel policy for
-	 * /proc/PID/smaps) and TVA_FORCED_COLLAPSE (explicit user intent
-	 * via MADV_COLLAPSE that must not be second-guessed).
+	 * Apply bestfit order selection.  Skipped for TVA_SMAPS (must show
+	 * true kernel policy in /proc/PID/smaps) and TVA_FORCED_COLLAPSE
+	 * (explicit MADV_COLLAPSE intent must not be second-guessed).
 	 */
-	if (orders && type != TVA_SMAPS && type != TVA_FORCED_COLLAPSE) {
-		unsigned long (*fn)(struct vm_area_struct *, vm_flags_t,
-				    enum tva_type, unsigned long);
-
-		fn = READ_ONCE(mthp_order_filter_fn);
-		if (fn)
-			orders = fn(vma, vm_flags, type, orders);
-	}
+	if (orders && type != TVA_SMAPS && type != TVA_FORCED_COLLAPSE)
+		orders = mthp_bestfit_apply(vma, vm_flags, type, orders);
 	return orders;
 }
 
@@ -1029,6 +1458,9 @@ static int __init hugepage_init(void)
 	err = start_stop_khugepaged();
 	if (err)
 		goto err_khugepaged;
+
+	if (!register_sysctl("vm", mthp_bestfit_sysctls))
+		pr_warn("mthp_bestfit: sysctl registration failed\n");
 
 	return 0;
 err_khugepaged:
@@ -4993,6 +5425,8 @@ static int __init split_huge_pages_debugfs(void)
 {
 	debugfs_create_file("split_huge_pages", 0200, NULL, NULL,
 			    &split_huge_pages_fops);
+	debugfs_create_file("mthp_bestfit_stats", 0444, NULL, NULL,
+			    &mthp_bestfit_stats_fops);
 	return 0;
 }
 late_initcall(split_huge_pages_debugfs);

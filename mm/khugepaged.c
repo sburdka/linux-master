@@ -2528,22 +2528,10 @@ static void collapse_scan_mm_slot(unsigned int progress_max,
 			cc->progress++;
 			continue;
 		}
-		/*
-		 * If a pluggable order filter is registered (e.g. mthp_bestfit),
-		 * ask it whether PMD_ORDER is appropriate for this VMA's size.
-		 * Skipping VMAs the filter would suppress saves the full cost of
-		 * khugepaged_scan_pmd() on VMAs too small for 2 MB collapse.
-		 */
-		{
-			unsigned long (*fn)(struct vm_area_struct *, vm_flags_t,
-					    enum tva_type, unsigned long);
-
-			fn = READ_ONCE(mthp_order_filter_fn);
-			if (fn && !fn(vma, vma->vm_flags, TVA_KHUGEPAGED,
-				      BIT(PMD_ORDER))) {
-				cc->progress++;
-				continue;
-			}
+		/* bestfit: skip VMAs the policy would demote below PMD_ORDER */
+		if (thp_bestfit_suppress_pmd(vma)) {
+			cc->progress++;
+			continue;
 		}
 		hstart = round_up(vma->vm_start, HPAGE_PMD_SIZE);
 		hend = round_down(vma->vm_end, HPAGE_PMD_SIZE);
