@@ -193,26 +193,50 @@ static unsigned long bf_order_free_count(int order)
 	return total;
 }
 
-static int bf_pressure_limit(int start, bool *stall_avoided)
+/*
+ * bf_pressure_limit - check whether @order (possibly exec-boosted) is
+ * available without triggering compaction, with @geo_order as the
+ * fall-back if the boost target is blocked.
+ *
+ * Returns:
+ *   @order or @geo_order — one of them met the threshold
+ *  -1                   — neither met; caller should suppress mTHP entirely
+ *
+ * Walking further down (below geo_order) is intentionally avoided: the
+ * sub-PMD allocation loop in alloc_anon_folio() already iterates through
+ * all allowed orders from highest to lowest.  We only need to cap the top.
+ * Picking an order below geo_order that also has insufficient MOVABLE
+ * blocks (our nr_free check is migratetype-blind) just adds another
+ * compaction attempt.
+ */
+static int bf_pressure_limit(int order, int geo_order, bool *stall_avoided)
 {
 	unsigned long free_count;
-	int min_free, order;
+	int min_free;
 
 	*stall_avoided = false;
 	if (!READ_ONCE(bf_pressure_aware))
-		return start;
+		return order;
 
-	min_free   = READ_ONCE(bf_pressure_min_free);
-	free_count = bf_order_free_count(start);
+	min_free = READ_ONCE(bf_pressure_min_free);
+
+	free_count = bf_order_free_count(order);
 	if (free_count >= (unsigned long)min_free)
-		return start;
+		return order;
+
+	/* Exec-boosted order blocked; try the un-boosted geometric order */
+	if (order != geo_order) {
+		if (free_count > 0)
+			*stall_avoided = true;
+		free_count = bf_order_free_count(geo_order);
+		if (free_count >= (unsigned long)min_free)
+			return geo_order;
+	}
+
+	/* Neither available; flag if some blocks existed (stall avoided) */
 	if (free_count > 0)
 		*stall_avoided = true;
-
-	for (order = start - 1; order >= 2; order--)
-		if (bf_order_free_count(order) >= (unsigned long)min_free)
-			return order;
-	return 2;
+	return -1; /* suppress: fall back to 4 KB pages, no compaction */
 }
 
 static bool bf_order_local(int order)
@@ -244,6 +268,20 @@ static bool bf_order_local(int order)
  *
  * Called from __thp_vma_allowable_orders() for TVA_PAGEFAULT and
  * TVA_KHUGEPAGED.  Returns a subset of @allowed_orders.
+ *
+ * SCOPE: sub-PMD order selection only.
+ *
+ * The PMD fault path (do_huge_pmd_anonymous_page / handle_mm_fault) calls
+ * thp_vma_allowable_order() with BIT(PMD_ORDER) alone.  If we suppress that,
+ * the fault falls through to handle_pte_fault() → alloc_anon_folio() which
+ * retries sub-PMD orders with vma_thp_gfp_mask() — for MADV_HUGEPAGE VMAs
+ * that mask includes __GFP_DIRECT_RECLAIM, so each sub-PMD retry can
+ * increment compact_stall.  One PMD suppression → four sub-PMD compaction
+ * attempts = 4× more compact_stall events.
+ *
+ * The kernel's thp_vma_suitable_order() already enforces PMD geometry
+ * before thp_vma_allowable_order() is consulted, so our filter is both
+ * redundant and harmful on the PMD path.  Bypass it.
  */
 static unsigned long mthp_bestfit_apply(struct vm_area_struct *vma,
 					vm_flags_t vm_flags,
@@ -253,10 +291,18 @@ static unsigned long mthp_bestfit_apply(struct vm_area_struct *vma,
 	bool pdg = false, sa = false, ndg = false, lc = false;
 	unsigned long page_size, first_aligned, new_orders;
 	unsigned long min_pages;
-	int order, limited, vtype;
+	int order, vtype;
 	bool suppressed;
 
 	if (!READ_ONCE(bf_enabled))
+		return allowed_orders;
+
+	/*
+	 * Only filter when sub-PMD orders are present in the mask.
+	 * If allowed_orders has no sub-PMD bits (only BIT(PMD_ORDER)),
+	 * this is a single-order PMD check — return unchanged.
+	 */
+	if (!(allowed_orders & (BIT(PMD_ORDER) - 1)))
 		return allowed_orders;
 
 	vtype     = bf_vma_type(vma);
@@ -283,44 +329,58 @@ static unsigned long mthp_bestfit_apply(struct vm_area_struct *vma,
 	}
 
 	/* Step 2: Geometric best-fit — largest order where min_pages fit */
-	for (order = PMD_ORDER; order >= 2; order--) {
-		page_size     = 1UL << (PAGE_SHIFT + order);
-		first_aligned = ALIGN(vma->vm_start, page_size);
-		if (first_aligned < vma->vm_end &&
-		    (vma->vm_end - first_aligned) >= min_pages * page_size)
-			break;
-	}
-	if (order < 2) {
-		bf_count(-1, vtype, true, false, false, false, false);
-		return 0;
-	}
+	{
+		int geo_order;
 
-	/* Step 3: Exec boost — widen iTLB coverage for ELF .text */
-	if ((vma->vm_flags & VM_EXEC) && vma->vm_file &&
-	    READ_ONCE(bf_exec_boost) && order < PMD_ORDER)
-		order++;
-
-	/* Step 4: Pressure limit */
-	limited = bf_pressure_limit(order, &sa);
-	if (limited < order) {
-		order = limited;
-		pdg   = true;
-	}
-
-	/* Step 5: NUMA locality — prefer orders the local node can serve */
-	if (!bf_order_local(order)) {
-		int o;
-
-		for (o = order - 1; o >= 2; o--) {
-			if (bf_order_local(o)) {
-				order = o;
-				ndg   = true;
+		for (geo_order = PMD_ORDER - 1; geo_order >= 2; geo_order--) {
+			page_size     = 1UL << (PAGE_SHIFT + geo_order);
+			first_aligned = ALIGN(vma->vm_start, page_size);
+			if (first_aligned < vma->vm_end &&
+			    (vma->vm_end - first_aligned) >= min_pages * page_size)
 				break;
-			}
+		}
+		if (geo_order < 2) {
+			bf_count(-1, vtype, true, false, false, false, false);
+			return 0;
+		}
+		order = geo_order;
+
+		/* Step 3: Exec boost — tentatively raise order for iTLB */
+		if ((vma->vm_flags & VM_EXEC) && vma->vm_file &&
+		    READ_ONCE(bf_exec_boost) && order < PMD_ORDER - 1)
+			order++;
+
+		/* Step 4: Pressure limit — suppress if geometric order unavailable.
+		 * bf_pressure_limit() tries @order first, then falls back to
+		 * geo_order, then returns -1 (suppress entirely).  No further
+		 * walk-down: picking an even smaller order often still needs
+		 * compaction (nr_free is migratetype-blind) and multiplies
+		 * compact_stall events. */
+		limited = bf_pressure_limit(order, geo_order, &sa);
+		if (limited < 0) {
+			/* No available order — suppress, fall back to 4 KB */
+			bf_count(-1, vtype, true, true, false, false, sa);
+			if (READ_ONCE(bf_dry_run))
+				return allowed_orders;
+			return 0;
+		}
+		if (limited < order) {
+			order = limited;
+			pdg   = true;
 		}
 	}
 
-	/* Step 6: Lifetime conservation — conserve blocks for new VMAs */
+	/* Step 5: NUMA locality — prefer orders the local node can serve.
+	 * Only try one step down; suppress if even that is unavailable locally
+	 * to avoid multiplying cross-node allocation attempts. */
+	if (!bf_order_local(order)) {
+		if (order > 2 && bf_order_local(order - 1)) {
+			order--;
+			ndg = true;
+		}
+	}
+
+	/* Step 6: Lifetime conservation — conserve blocks for brand-new VMAs */
 	if (READ_ONCE(bf_lifetime_aware) && !vma->anon_vma && order > 2) {
 		order--;
 		lc = true;
@@ -336,25 +396,20 @@ static unsigned long mthp_bestfit_apply(struct vm_area_struct *vma,
 }
 
 /*
- * thp_bestfit_suppress_pmd - should khugepaged skip this VMA entirely?
+ * thp_bestfit_suppress_pmd - should khugepaged skip PMD collapse for @vma?
  *
- * Returns true if the bestfit policy would suppress PMD_ORDER collapse for
- * @vma, allowing khugepaged to skip the full khugepaged_scan_pmd() cost.
+ * Only the pressure check is applied here.  Geometric suitability (whether
+ * the VMA has an aligned 2 MB range at all) is already enforced by
+ * khugepaged's own hstart/hend calculation; adding a min_pages=2 check
+ * here would wrongly suppress legitimate 2–4 MB VMAs that have exactly
+ * one collapsible PMD range.
  */
 bool thp_bestfit_suppress_pmd(struct vm_area_struct *vma)
 {
-	unsigned long first_aligned;
-
 	if (!READ_ONCE(bf_enabled))
 		return false;
 
-	/* Geometric check: need at least min_pages aligned 2 MB pages */
-	first_aligned = ALIGN(vma->vm_start, HPAGE_PMD_SIZE);
-	if (first_aligned + (unsigned long)READ_ONCE(bf_min_pages) * HPAGE_PMD_SIZE >
-	    vma->vm_end)
-		return true;
-
-	/* Pressure check: skip if PMD blocks below threshold */
+	/* Skip collapse if PMD-order free blocks are below the pressure threshold */
 	if (READ_ONCE(bf_pressure_aware) &&
 	    bf_order_free_count(PMD_ORDER) <
 	    (unsigned long)READ_ONCE(bf_pressure_min_free))
@@ -513,17 +568,23 @@ static int mthp_bestfit_stats_show(struct seq_file *m, void *v)
 	}
 
 	seq_puts(m, "\nTuning guide for compact_stall\n");
+	seq_printf(m,
+		   "  PMD_ORDER requests pass through unchanged (bypass active).\n"
+		   "  bestfit only selects among sub-PMD orders 2..%d.\n",
+		   PMD_ORDER - 1);
 	if (total.compact_stall_avoided > 0)
 		seq_printf(m,
-			   "  %llu potential stalls proactively avoided.\n"
-			   "  If compact_stall in /proc/vmstat is still rising,\n"
-			   "  increase pressure_min_free (currently %d).\n",
-			   total.compact_stall_avoided, bf_pressure_min_free);
+			   "  %llu sub-PMD suppressed (fell back to 4 KB pages).\n"
+			   "  Each suppression avoids up to %d compaction attempts.\n"
+			   "  If compact_stall is still rising, increase\n"
+			   "  pressure_min_free (currently %d blocks).\n",
+			   total.compact_stall_avoided,
+			   PMD_ORDER - 2, bf_pressure_min_free);
 	else
 		seq_puts(m,
-			 "  0 stalls avoided — no race-window pressure detected.\n"
-			 "  If compact_stall is high, it comes from non-mTHP sources\n"
-			 "  (DMA, kmalloc, hugetlbfs) outside bestfit's scope.\n");
+			 "  0 suppressions — pressure threshold not triggered.\n"
+			 "  Residual compact_stall comes from non-mTHP sources\n"
+			 "  (DMA, kmalloc, hugetlbfs, madvised PMD collapse).\n");
 
 #undef PCT
 	return 0;
