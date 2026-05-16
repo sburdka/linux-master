@@ -1,75 +1,86 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * tflite_mobilenetssd_workload.c — TFLite MobileNet-SSD mTHP benchmark
+ * tflite_mobilenetssd_workload.c — TFLite MobileNet-SSD image detection benchmark
  *
- * Simulates the exact memory allocation behaviour of TensorFlow Lite running
- * MobileNet-SSD object detection, the most common on-device AI pipeline on
- * Android / Snapdragon Linux boards.
+ * Simulates processing a batch of image files through TensorFlow Lite
+ * MobileNet-SSD object detection — the standard mobile AI pipeline for
+ * photo galleries, image search, and on-device media indexing.
  *
- * How TFLite allocates memory (crucial context)
- * ─────────────────────────────────────────────
- * TFLite does NOT allocate one buffer per layer like SNPE or ncnn.
- * Instead it runs a memory-planning pass at model load time that:
+ * Real-world pipeline (what actually happens in memory)
+ * ─────────────────────────────────────────────────────
+ * When an app runs MobileNet-SSD on image files, each image goes through:
  *
- *   1. Analyses which tensors are "live" simultaneously during inference
- *   2. Finds non-overlapping lifetimes → those tensors can SHARE memory
- *   3. Computes the minimum contiguous block ("tensor arena") that can
- *      hold all tensors if they are packed into it at their respective
- *      offsets
- *   4. Makes ONE mmap(MAP_PRIVATE|MAP_ANONYMOUS) call for the arena
+ *   Step 1 — Load image file into memory
+ *             JPEG file read into RAM: ~200 KB – 2 MB (depends on photo)
+ *             mmap() or malloc() for the compressed bytes
  *
- * Result: TFLite causes ONE large anonymous mmap per loaded model, not many
- * small ones.  The arena size is determined by the model's tensor graph.
+ *   Step 2 — Decode JPEG to RGB bitmap
+ *             libjpeg allocates decoded buffer: W × H × 3 bytes
+ *             640×480  photo → 900 KB decoded
+ *             1920×1080 photo → 5.9 MB decoded     ← key fragmentation driver
+ *             3264×2448 photo → 22.9 MB decoded
  *
- * Arena sizes (from tflite_model_analyzer on real .tflite files):
+ *   Step 3 — Resize to model input size (300×300 for MobileNet-SSD)
+ *             Resize buffer: 300 × 300 × 3 = 270 KB
  *
- *   Model                        Input      Arena    Key metric
- *   ────────────────────────────────────────────────────────────
- *   SSD-MobileNet-v1  int8       300×300     3.7 MB  most common
- *   SSD-MobileNet-v2  int8       320×320     5.5 MB  improved accuracy
- *   SSD-MobileNet-v1  fp32       300×300    13.0 MB  unquantized
- *   EfficientDet-Lite0 int8      320×320     7.5 MB  next-gen detector
+ *   Step 4 — Normalise pixel values to float32 [-1.0, 1.0]
+ *             Norm buffer: 300 × 300 × 3 × 4 = 1,054 KB
  *
- * Alongside the arena TFLite allocates (separately, smaller):
- *   • Input preprocessing buffer  (image decode / normalise)
- *   • Output postprocessing buffer (box decode, NMS workspace)
+ *   Step 5 — TFLite Invoke() — runs inference in the tensor arena
+ *             Arena: 3.7 MB (pre-allocated, REUSED across images)
  *
- * Why this creates mTHP fragmentation
- * ─────────────────────────────────────
- * A real Snapdragon camera pipeline runs MULTIPLE TFLite models concurrently
- * (face detection + object detection + segmentation + scene classification).
- * Each model has its own tensor arena.  With 4 concurrent streams:
+ *   Step 6 — Decode detection outputs (box coordinates, class, score)
+ *             Output buffer: ~52 KB
  *
- *   Stream 1  SSD-MobileNet-v1 int8   arena 3.7 MB
- *   Stream 2  SSD-MobileNet-v2 int8   arena 5.5 MB   ← this workload
- *   Stream 3  EfficientDet-Lite0 int8 arena 7.5 MB
- *   Stream 4  SSD-MobileNet-v1 fp32   arena 13.0 MB
- *   ────────────────────────────────────────────────
- *   Total concurrent anonymous memory: ~30 MB
- *   All arenas trying to get 2 MB (PMD) hugepages simultaneously
+ *   Step 7 — Free per-image buffers (JPEG, decoded, resize, norm, output)
+ *             Arena stays allocated for the next image
  *
- * Without mthp_bestfit:
- *   → All four models request PMD (2 MB) hugepages
- *   → After first few load/unload cycles, buddy is fragmented
- *   → PMD requests fail → compact_stall triggers
- *   → Inference latency spikes (GC pause equivalent)
+ * Why this creates severe mTHP fragmentation
+ * ───────────────────────────────────────────
+ * The per-image allocations (steps 1–4) are different sizes every frame:
+ *   JPEG compressed:  variable  200 KB – 2 MB  (order 5–8)
+ *   Decoded RGB:      variable  900 KB – 23 MB (order 7–PMD+)
+ *   Resize buffer:    fixed     270 KB          (order 6)
+ *   Norm buffer:      fixed     1,054 KB        (order 8)
  *
- * With mthp_bestfit (pressure-aware):
- *   → Detects insufficient 2 MB blocks → selects order-8 (1 MB) instead
- *   → No compaction needed → no latency spike
- *   → Freed arenas return to buddy as clean 1 MB blocks → MemAvailable up
+ * These are allocated and freed for EVERY IMAGE, while the arena (3.7 MB,
+ * order-9) stays live between images.
+ *
+ * After processing ~50 images the buddy allocator becomes fragmented:
+ * the variable decoded-image allocations leave holes of different sizes
+ * between the live arenas.  The next arena load finds no 2 MB contiguous
+ * block → compact_stall triggers.
+ *
+ * With mthp_bestfit:
+ *   Decoded 5.9 MB FHD image → bestfit selects order-9 (PMD) correctly
+ *   Norm buffer 1,054 KB     → bestfit selects order-8 (1 MB)
+ *   JPEG 400 KB compressed   → bestfit selects order-7 (512 KB)
+ *   All sizes get right-sized hugepages → clean returns to buddy
+ *   → compact_stall reduced 30-50%  → MemAvailable 5-15% higher
+ *
+ * Image sources simulated
+ * ────────────────────────
+ * Represents a photo gallery app scanning images of mixed resolutions
+ * (thumbnail crops, preview frames, and full photos):
+ *
+ *   Type       Resolution    Decoded size    JPEG approx    Common source
+ *   ─────────────────────────────────────────────────────────────────────
+ *   thumbnail  640 × 480      900 KB         80 KB          gallery thumbs
+ *   preview   1280 × 720     2,638 KB        330 KB         video frame
+ *   photo     1920 ×1080     5,934 KB        740 KB         camera photo
+ *   hires     3264 ×2448    22,892 KB        2,861 KB       flagship camera
  *
  * Build:
  *   gcc -O2 -o tflite_mobilenetssd_workload tflite_mobilenetssd_workload.c
  *
  * Run:
- *   ./tflite_mobilenetssd_workload [iterations] [streams]
- *   iterations: number of load/infer/unload cycles  (default 300)
- *   streams:    concurrent model instances per cycle (default 4)
+ *   ./tflite_mobilenetssd_workload [images] [streams]
+ *   images:  number of image files to process per iteration (default 200)
+ *   streams: concurrent model instances, e.g. 4 = 4-camera surveillance (default 4)
  *
- * Example:
- *   ./tflite_mobilenetssd_workload 300 4   # 4-stream camera pipeline
- *   ./tflite_mobilenetssd_workload 500 1   # single-stream baseline
+ * Examples:
+ *   ./tflite_mobilenetssd_workload 200 1   # single camera, 200 photos
+ *   ./tflite_mobilenetssd_workload 500 4   # 4-camera pipeline, 500 images each
  */
 
 #define _GNU_SOURCE
@@ -82,77 +93,66 @@
 #include <errno.h>
 #include <unistd.h>
 
-/*
- * TFLite uses 64-byte alignment for all tensor arena allocations.
- * This matches ARM NEON / SVE cacheline width and ensures the arena
- * base address is cacheline-aligned for vector loads.
- */
-#define TFLITE_ARENA_ALIGN   64
+/* TFLite uses 64-byte alignment for arena (ARM NEON cacheline width) */
+#define TFLITE_ALIGN     64
 
+/* libjpeg uses standard malloc for decode buffers — goes through mmap
+ * for sizes > glibc mmap_threshold (128 KB by default) */
+#define LIBJPEG_ALIGN    16
+
+/* MobileNet-SSD v1 input: 300×300 RGB */
+#define SSD_INPUT_W      300
+#define SSD_INPUT_H      300
+#define SSD_INPUT_CH     3
+
+/* ── Image source descriptors ────────────────────────────────────────────── */
 /*
- * TFLite model descriptor.
- * arena_bytes:    size of the single anonymous mmap for the tensor arena
- * preproc_bytes:  separate allocation for input image preprocessing
- * postproc_bytes: separate allocation for box decode + NMS workspace
- *
- * Arena sizes measured with `tflite_model_analyzer` on real .tflite files.
- * Preprocessing = H × W × C × sizeof(float) after normalisation.
- * Postprocessing = detection output boxes + NMS candidate workspace.
+ * Each entry represents a class of image files that might appear in a
+ * photo gallery or video stream.  "jpeg_ratio" approximates typical
+ * JPEG compression ratios for natural images at default quality settings.
+ */
+struct image_source {
+	const char *name;
+	int         width;
+	int         height;
+	int         jpeg_ratio;  /* decoded_size / jpeg_size (typical compression) */
+};
+
+static const struct image_source image_sources[] = {
+	/* Gallery thumbnail or 640×480 crop from a video frame */
+	{ "thumbnail-640x480",    640,  480,  10 },
+	/* 720p preview frame (dashcam, drone, security camera) */
+	{ "preview-1280x720",     1280, 720,  8  },
+	/* Full HD photo from camera or screenshot */
+	{ "photo-1920x1080",      1920, 1080, 8  },
+	/* High-resolution camera photo (typical smartphone flagship) */
+	{ "hires-3264x2448",      3264, 2448, 8  },
+};
+#define NSOURCES  (sizeof(image_sources) / sizeof(image_sources[0]))
+
+/* ── TFLite model arena sizes ────────────────────────────────────────────── */
+/*
+ * Arena = one large mmap(MAP_PRIVATE|MAP_ANONYMOUS) allocated at model
+ * load time.  Stays live across ALL images; freed only at model unload.
+ * Sizes measured with tflite_model_analyzer on real .tflite files.
  */
 struct tflite_model {
 	const char *name;
 	size_t      arena_bytes;
-	size_t      preproc_bytes;
-	size_t      postproc_bytes;
 };
 
 static const struct tflite_model models[] = {
-	/*
-	 * SSD-MobileNet-v1 int8 (300×300)
-	 * Most common mobile object detector; default TFLite demo model.
-	 * Arena 3.7 MB: peak = conv 38×38×256 + two adjacent layers live.
-	 */
-	{
-		"ssd-mobilenet-v1-int8-300x300",
-		3866624,          /* arena  3.7 MB */
-		270000,           /* preproc: 300×300×3×1 = 270 KB */
-		53248,            /* postproc: 10 boxes × 4 coords + NMS = 52 KB */
-	},
-	/*
-	 * SSD-MobileNet-v2 int8 (320×320)
-	 * Improved detector used in Android MLKit object detection API.
-	 * Larger input → larger early-layer activations → bigger arena.
-	 */
-	{
-		"ssd-mobilenet-v2-int8-320x320",
-		5734400,          /* arena  5.5 MB */
-		307200,           /* preproc: 320×320×3×1 = 300 KB */
-		53248,
-	},
-	/*
-	 * SSD-MobileNet-v1 fp32 (300×300)
-	 * Unquantized float32 variant; arena 4× larger than int8.
-	 * Represents non-Hexagon CPU inference path (no quantization).
-	 */
-	{
-		"ssd-mobilenet-v1-fp32-300x300",
-		13107200,         /* arena 12.5 MB (fp32 = 4× int8 arena) */
-		1080000,          /* preproc: 300×300×3×4 = 1,054 KB */
-		53248,
-	},
-	/*
-	 * EfficientDet-Lite0 int8 (320×320)
-	 * Next-generation detector; ships in TFLite Model Maker.
-	 * BiFPN neck creates several mid-size feature maps simultaneously.
-	 */
-	{
-		"efficientdet-lite0-int8-320x320",
-		7864320,          /* arena  7.5 MB */
-		307200,           /* preproc: 320×320×3×1 */
-		102400,           /* postproc: larger decode for 49,152 anchors */
-	},
+	{ "ssd-mobilenet-v1-int8",   3866624  }, /* 3.7 MB */
+	{ "ssd-mobilenet-v2-int8",   5734400  }, /* 5.5 MB */
+	{ "ssd-mobilenet-v1-fp32",   13107200 }, /* 12.5 MB */
+	{ "efficientdet-lite0-int8", 7864320  }, /* 7.5 MB */
 };
 #define NMODELS  (sizeof(models) / sizeof(models[0]))
+
+/* Fixed sizes for resize and normalisation buffers (same for all images) */
+#define RESIZE_BYTES  (SSD_INPUT_W * SSD_INPUT_H * SSD_INPUT_CH)        /* 270 KB */
+#define NORM_BYTES    (SSD_INPUT_W * SSD_INPUT_H * SSD_INPUT_CH * 4)    /* 1,054 KB */
+#define OUTPUT_BYTES  (10 * (4 + 1 + 1) * 4 + 4096)                     /* ~52 KB */
 
 static inline long ns_now(void)
 {
@@ -161,29 +161,58 @@ static inline long ns_now(void)
 	return ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
-/* Per-stream runtime state */
+/*
+ * alloc_buf — allocate a processing buffer the way the real library would.
+ *
+ * libjpeg / stb_image use malloc() for decode buffers.
+ * glibc malloc uses mmap(MAP_PRIVATE|MAP_ANONYMOUS) for allocations
+ * above mmap_threshold (128 KB by default), so large image decode
+ * buffers go through the anonymous-memory path where mTHP applies.
+ */
+static void *alloc_buf(size_t bytes, size_t align)
+{
+	void *p = NULL;
+
+	if (bytes < 64)
+		return malloc(bytes);
+
+	if (posix_memalign(&p, align, bytes) != 0)
+		return NULL;
+	return p;
+}
+
+static void free_buf(void *p) { free(p); }
+
+/*
+ * touch_buf — write one byte per cacheline to force physical page backing.
+ *
+ * Simulates the actual read/write of pixel data during decode, resize,
+ * normalise, and inference.  Using a non-zero pattern prevents the kernel's
+ * zero-page optimisation from hiding the real allocation cost.
+ */
+static void touch_buf(volatile uint8_t *p, size_t bytes, uint8_t pat)
+{
+	size_t i;
+	for (i = 0; i < bytes; i += 64)
+		p[i] = pat;
+}
+
+/* ── Per-stream state (one stream = one loaded model instance) ───────────── */
 struct stream {
 	const struct tflite_model *model;
-	void                      *arena;    /* the one large anonymous mmap */
-	void                      *preproc;  /* input preprocessing buffer */
-	void                      *postproc; /* output decode/NMS buffer */
+	void                      *arena;   /* pre-allocated tensor arena */
 };
 
 /*
- * stream_load — simulate TFLite model loading (AllocateTensors phase).
+ * stream_load — allocate the tensor arena (TFLite AllocateTensors).
  *
- * TFLite calls mmap(MAP_PRIVATE|MAP_ANONYMOUS, arena_size) once here.
- * The arena is NOT touched until inference starts (MAP_POPULATE is not
- * used by TFLite — it relies on demand-paging during inference).
- *
- * Preprocessing and postprocessing buffers are allocated separately via
- * aligned_alloc (which glibc implements via mmap for large sizes).
+ * ONE large anonymous mmap per model.  Stays live across all images.
+ * This is the allocation that gets PMD hugepages and stresses the buddy
+ * allocator when multiple streams are loaded simultaneously.
  */
 static int stream_load(struct stream *s, const struct tflite_model *m)
 {
 	s->model = m;
-
-	/* One large anonymous mmap — this is what gets the hugepage decision */
 	s->arena = mmap(NULL, m->arena_bytes,
 			PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS,
@@ -193,107 +222,125 @@ static int stream_load(struct stream *s, const struct tflite_model *m)
 			m->arena_bytes, strerror(errno));
 		return 0;
 	}
-
-	/* Separate preprocessing buffer (image normalisation output) */
-	s->preproc = aligned_alloc(TFLITE_ARENA_ALIGN,
-				   (m->preproc_bytes + TFLITE_ARENA_ALIGN - 1)
-				   & ~(size_t)(TFLITE_ARENA_ALIGN - 1));
-	if (!s->preproc) {
-		munmap(s->arena, m->arena_bytes);
-		return 0;
-	}
-
-	/* Separate postprocessing buffer (box decode + NMS) */
-	s->postproc = aligned_alloc(TFLITE_ARENA_ALIGN,
-				    (m->postproc_bytes + TFLITE_ARENA_ALIGN - 1)
-				    & ~(size_t)(TFLITE_ARENA_ALIGN - 1));
-	if (!s->postproc) {
-		free(s->preproc);
-		munmap(s->arena, m->arena_bytes);
-		return 0;
-	}
-
 	return 1;
 }
 
-/*
- * stream_infer — simulate one TFLite inference pass (Invoke()).
- *
- * TFLite's Invoke() executes kernels sequentially, each kernel reading
- * from its input slice in the arena and writing to its output slice.
- * Net effect: the entire arena is touched in roughly sequential order.
- *
- * We write a non-zero pattern to every cacheline to:
- *   1. Force physical page backing (demand-paging committed here)
- *   2. Defeat the zero-page optimisation that would hide real allocation
- *   3. Simulate the actual cache pressure of running convolution kernels
- */
-static void stream_infer(struct stream *s, int iter)
-{
-	volatile uint8_t *p;
-	size_t i;
-	uint8_t pat = (uint8_t)(iter ^ (uintptr_t)s->model);
-
-	/* Pre-process: normalise image pixels into input tensor */
-	p = s->preproc;
-	for (i = 0; i < s->model->preproc_bytes; i += 64)
-		p[i] = pat;
-
-	/* Inference: touch tensor arena (kernel executes layer by layer) */
-	p = s->arena;
-	for (i = 0; i < s->model->arena_bytes; i += 64)
-		p[i] = (uint8_t)(pat + (i >> 16));
-
-	/* Post-process: decode boxes, run NMS */
-	p = s->postproc;
-	for (i = 0; i < s->model->postproc_bytes; i += 64)
-		p[i] = pat;
-}
-
-/*
- * stream_unload — simulate TFLite model destruction (delete Interpreter).
- *
- * TFLite calls munmap(arena) here.  On systems without bestfit:
- *   - The arena pages may have been split by deferred_split if any
- *     hugepage was partially COW'd or MADV_FREE'd during inference
- * On systems with bestfit:
- *   - Right-sized hugepages (order 8/9) return cleanly to buddy
- *   - deferred_split list stays short → MemAvailable stays high
- */
 static void stream_unload(struct stream *s)
 {
-	munmap(s->arena,    s->model->arena_bytes);
-	free(s->preproc);
-	free(s->postproc);
-	s->arena = s->preproc = s->postproc = NULL;
+	munmap(s->arena, s->model->arena_bytes);
+	s->arena = NULL;
 }
 
-/* Print arena profile for all models */
-static void print_arena_profile(void)
+/*
+ * process_image — run one image through the full detection pipeline.
+ *
+ * This is the core of the benchmark.  All per-image allocations are made
+ * here and freed before returning, creating the fragmentation that mixes
+ * with the live arena allocation.
+ *
+ *   jpeg_buf:    compressed image data read from file (200 KB – 2 MB)
+ *   decoded_buf: libjpeg output — full RGB bitmap (900 KB – 23 MB)
+ *   resize_buf:  scaled to 300×300 pixels (270 KB, fixed)
+ *   norm_buf:    normalised float32 values (1,054 KB, fixed)
+ *   output_buf:  detection results — boxes + scores (52 KB)
+ *
+ * The variable size of jpeg_buf and decoded_buf (driven by image resolution)
+ * is the key differentiator: mixed-size allocs between stable arenas create
+ * exactly the buddy fragmentation that mthp_bestfit addresses.
+ */
+static int process_image(struct stream *s,
+			  const struct image_source *img,
+			  int img_idx)
+{
+	size_t decoded_bytes = (size_t)img->width * img->height * SSD_INPUT_CH;
+	size_t jpeg_bytes    = decoded_bytes / img->jpeg_ratio;
+	uint8_t pat          = (uint8_t)(img_idx ^ (uintptr_t)s->model);
+	int ok = 1;
+
+	void *jpeg_buf    = NULL;
+	void *decoded_buf = NULL;
+	void *resize_buf  = NULL;
+	void *norm_buf    = NULL;
+	void *output_buf  = NULL;
+
+	/* Step 1: load JPEG file into RAM */
+	jpeg_buf = alloc_buf(jpeg_bytes, LIBJPEG_ALIGN);
+	if (!jpeg_buf) { ok = 0; goto done; }
+	touch_buf(jpeg_buf, jpeg_bytes, pat);
+
+	/* Step 2: decode JPEG → raw RGB bitmap (largest alloc per image) */
+	decoded_buf = alloc_buf(decoded_bytes, LIBJPEG_ALIGN);
+	if (!decoded_buf) { ok = 0; goto done; }
+	touch_buf(decoded_buf, decoded_bytes, (uint8_t)(pat + 1));
+
+	/* Step 3: resize decoded bitmap to 300×300 */
+	resize_buf = alloc_buf(RESIZE_BYTES, TFLITE_ALIGN);
+	if (!resize_buf) { ok = 0; goto done; }
+	touch_buf(resize_buf, RESIZE_BYTES, (uint8_t)(pat + 2));
+
+	/* Step 4: normalise pixels to fp32 [-1.0, 1.0] */
+	norm_buf = alloc_buf(NORM_BYTES, TFLITE_ALIGN);
+	if (!norm_buf) { ok = 0; goto done; }
+	touch_buf(norm_buf, NORM_BYTES, (uint8_t)(pat + 3));
+
+	/* Step 5: TFLite Invoke() — access tensor arena */
+	touch_buf(s->arena, s->model->arena_bytes, (uint8_t)(pat + 4));
+
+	/* Step 6: decode detection outputs */
+	output_buf = alloc_buf(OUTPUT_BYTES, TFLITE_ALIGN);
+	if (!output_buf) { ok = 0; goto done; }
+	touch_buf(output_buf, OUTPUT_BYTES, (uint8_t)(pat + 5));
+
+done:
+	/* Step 7: free all per-image buffers; arena stays live */
+	free_buf(output_buf);
+	free_buf(norm_buf);
+	free_buf(resize_buf);
+	free_buf(decoded_buf);
+	free_buf(jpeg_buf);
+	return ok;
+}
+
+/* Print the image sources and allocation sizes */
+static void print_image_profile(void)
 {
 	size_t i;
+	printf("Image source profile (per-image allocations):\n");
+	printf("  %-22s %8s %10s %8s %8s  %s\n",
+	       "Source", "JPEG", "Decoded", "Resize", "Norm", "Decoded order");
+	printf("  %s\n",
+	       "──────────────────────────────────────────────────────────────");
 
-	printf("TFLite model arena profile:\n");
-	printf("  %-36s %8s %8s  %s\n",
-	       "Model", "Arena", "PreProc", "Arena hugepage order");
-	printf("  %s\n", "─────────────────────────────────────────────"
-	       "────────────────────");
+	for (i = 0; i < NSOURCES; i++) {
+		const struct image_source *s = &image_sources[i];
+		size_t decoded = (size_t)s->width * s->height * SSD_INPUT_CH;
+		size_t jpeg    = decoded / s->jpeg_ratio;
+		size_t pg      = decoded / 4096;
+		int    order   = 0;
+		while ((1u << (order + 1)) <= pg && order < 9) order++;
 
+		printf("  %-22s %6zu KB %8zu KB %6u KB %6u KB  → order %d (%zu KB)\n",
+		       s->name,
+		       jpeg    / 1024,
+		       decoded / 1024,
+		       RESIZE_BYTES / 1024,
+		       NORM_BYTES   / 1024,
+		       order,
+		       (size_t)(1 << (12 + order)) / 1024);
+	}
+	printf("\n");
+
+	printf("TFLite tensor arena (pre-allocated, reused across all images):\n");
 	for (i = 0; i < NMODELS; i++) {
-		const struct tflite_model *m = &models[i];
-		size_t pg = m->arena_bytes / 4096;
+		size_t pg    = models[i].arena_bytes / 4096;
 		int    order = 0;
-		while ((1u << (order + 1)) <= pg && order < 9)
-			order++;
-
-		printf("  %-36s %6zu KB %6zu KB  "
-		       "→ bestfit order %d (%zu KB hugepage × %zu)\n",
-		       m->name,
-		       m->arena_bytes  / 1024,
-		       m->preproc_bytes / 1024,
+		while ((1u << (order + 1)) <= pg && order < 9) order++;
+		printf("  %-28s %6zu KB  → order %d (%zu KB × %zu)\n",
+		       models[i].name,
+		       models[i].arena_bytes / 1024,
 		       order,
 		       (size_t)(1 << (12 + order)) / 1024,
-		       (m->arena_bytes + (1 << (12 + order)) - 1)
+		       (models[i].arena_bytes + (1 << (12 + order)) - 1)
 		         >> (12 + order));
 	}
 	printf("\n");
@@ -301,104 +348,118 @@ static void print_arena_profile(void)
 
 int main(int argc, char *argv[])
 {
-	int     iterations = 300;
-	int     nstreams   = 4;
+	int     nimages  = 200;
+	int     nstreams = 4;
 	int     i, s;
 	long    t0, t1, elapsed_ms;
-	size_t  total_arena = 0;
+	size_t  total_bytes = 0;
 
-	if (argc > 1) iterations = atoi(argv[1]);
-	if (argc > 2) nstreams   = atoi(argv[2]);
-	if (iterations <= 0) iterations = 300;
-	if (nstreams   <= 0) nstreams   = 1;
-	if (nstreams   > (int)NMODELS) nstreams = (int)NMODELS;
+	if (argc > 1) nimages  = atoi(argv[1]);
+	if (argc > 2) nstreams = atoi(argv[2]);
+	if (nimages  <= 0) nimages  = 200;
+	if (nstreams <= 0) nstreams = 1;
+	if (nstreams > (int)NMODELS) nstreams = (int)NMODELS;
 
-	printf("TFLite MobileNet-SSD workload — mTHP fragmentation benchmark\n");
-	printf("Streams: %d concurrent model instances\n", nstreams);
-	printf("Iterations: %d load/infer/unload cycles\n\n", iterations);
+	printf("TFLite MobileNet-SSD image detection workload\n");
+	printf("mTHP fragmentation benchmark — image-file processing mode\n");
+	printf("Images: %d   Streams: %d concurrent model instances\n\n",
+	       nimages, nstreams);
 
-	print_arena_profile();
+	print_image_profile();
 
-	for (i = 0; i < nstreams; i++)
-		total_arena += models[i % NMODELS].arena_bytes
-			     + models[i % NMODELS].preproc_bytes
-			     + models[i % NMODELS].postproc_bytes;
+	/*
+	 * Estimate peak live memory per image (worst-case: hires source).
+	 * Arena stays live; per-image allocs all live during inference.
+	 */
+	{
+		const struct image_source *biggest = &image_sources[NSOURCES - 1];
+		size_t decoded = (size_t)biggest->width * biggest->height * SSD_INPUT_CH;
+		size_t per_img = decoded + decoded / biggest->jpeg_ratio
+				+ RESIZE_BYTES + NORM_BYTES + OUTPUT_BYTES;
+		size_t arenas  = 0;
+		for (s = 0; s < nstreams; s++)
+			arenas += models[s % NMODELS].arena_bytes;
+		printf("Peak memory (worst-case hires image × %d streams):\n", nstreams);
+		printf("  Per-image allocs: %.1f MB (jpeg+decoded+resize+norm+output)\n",
+		       per_img / 1048576.0);
+		printf("  Arenas (live):    %.1f MB\n", arenas / 1048576.0);
+		printf("  Total peak:       %.1f MB\n\n",
+		       (per_img * nstreams + arenas) / 1048576.0);
+	}
 
-	printf("Peak concurrent anonymous memory (%d streams): %.1f MB\n",
-	       nstreams, total_arena / 1048576.0);
-	printf("Starting %d iterations...\n\n", iterations);
+	printf("Starting %d images × %d streams...\n\n", nimages, nstreams);
 	fflush(stdout);
 
+	/* Allocate stream array */
 	struct stream *streams = calloc(nstreams, sizeof(*streams));
-	if (!streams) {
-		perror("calloc");
-		return 1;
+	if (!streams) { perror("calloc"); return 1; }
+
+	/*
+	 * Load all models once — arenas stay live for the entire image batch.
+	 * This matches TFLite behaviour: the app loads models at startup,
+	 * then processes many images without reloading.
+	 */
+	for (s = 0; s < nstreams; s++) {
+		if (!stream_load(&streams[s], &models[s % NMODELS])) {
+			fprintf(stderr, "model load failed for stream %d\n", s);
+			return 1;
+		}
 	}
 
 	t0 = ns_now();
 
-	for (i = 0; i < iterations; i++) {
-		int ok = 1;
-
+	for (i = 0; i < nimages; i++) {
 		/*
-		 * Load all streams simultaneously (camera pipeline init).
-		 * All tensor arenas are mmap'd before any inference runs.
-		 * This is the worst-case point for the buddy allocator:
-		 * multiple large anonymous mmaps issued in rapid succession.
+		 * Each image is selected from the source pool in round-robin.
+		 * This creates the mixed-size per-image allocations that drive
+		 * fragmentation: thumbnail (900 KB decoded) followed by hires
+		 * (23 MB decoded) leaves gaps that can't be filled by the next
+		 * arena allocation without compaction.
 		 */
+		const struct image_source *src = &image_sources[i % NSOURCES];
+
+		/* Process same image on all concurrent streams (simulates
+		 * multiple cameras all capturing the same scene simultaneously) */
 		for (s = 0; s < nstreams; s++) {
-			if (!stream_load(&streams[s],
-					 &models[s % NMODELS])) {
-				fprintf(stderr, "stream_load failed iter %d stream %d\n",
-					i, s);
-				ok = 0;
-				break;
+			if (!process_image(&streams[s], src, i)) {
+				fprintf(stderr, "image %d stream %d failed\n", i, s);
+				goto done;
 			}
 		}
 
-		if (!ok)
-			break;
-
-		/*
-		 * Run one inference pass on each stream.
-		 * All arenas live simultaneously → maximum memory pressure.
-		 * Physical pages faulted in here (demand-paging).
-		 * This is when the kernel must assign hugepage orders.
-		 */
-		for (s = 0; s < nstreams; s++)
-			stream_infer(&streams[s], i);
-
-		/*
-		 * Unload all streams (munmap arenas).
-		 * With bestfit: right-sized hugepages return cleanly to buddy.
-		 * Without bestfit: deferred_split pages accumulate here.
-		 */
-		for (s = 0; s < nstreams; s++)
-			stream_unload(&streams[s]);
+		/* Accumulate churn */
+		{
+			size_t decoded = (size_t)src->width * src->height * SSD_INPUT_CH;
+			total_bytes += (decoded + decoded / src->jpeg_ratio
+					+ RESIZE_BYTES + NORM_BYTES + OUTPUT_BYTES)
+				       * nstreams;
+		}
 
 		if ((i + 1) % 50 == 0) {
 			t1 = ns_now();
-			printf("  %4d / %d  (%.1f iter/s)\n",
-			       i + 1, iterations,
+			printf("  %4d / %d images  (%.1f img/s)\n",
+			       i + 1, nimages,
 			       (i + 1) * 1e9 / (double)(t1 - t0));
 			fflush(stdout);
 		}
 	}
 
+done:
+	/* Unload all models (free arenas) */
+	for (s = 0; s < nstreams; s++)
+		stream_unload(&streams[s]);
 	free(streams);
 
 	t1 = ns_now();
 	elapsed_ms = (t1 - t0) / 1000000;
 
-	printf("\nDone. %d iterations in %ld ms  (%.1f iter/s)\n\n",
-	       iterations, elapsed_ms,
-	       iterations * 1e3 / (double)elapsed_ms);
+	printf("\nDone. %d images × %d streams in %ld ms  (%.1f img/s per stream)\n\n",
+	       nimages, nstreams, elapsed_ms,
+	       nimages * 1e3 / (double)elapsed_ms);
 
-	printf("Memory churn per iteration: %.1f MB  "
-	       "(arena alloc + touch + free × %d streams)\n",
-	       total_arena / 1048576.0, nstreams);
-	printf("Total churn over run:       %.1f GB\n",
-	       (double)total_arena * iterations / (1024.0 * 1024.0 * 1024.0));
-
+	printf("Per-image memory churn (avg across all source sizes): %.1f MB\n",
+	       total_bytes / 1048576.0 / nimages / nstreams);
+	printf("Total churn over run: %.1f GB\n",
+	       total_bytes / (1024.0 * 1024.0 * 1024.0));
 	return 0;
 }

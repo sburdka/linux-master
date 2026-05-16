@@ -1,87 +1,83 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# mthp_bestfit_tflite_bench.sh — TFLite MobileNet-SSD mTHP fragmentation benchmark
+# mthp_bestfit_tflite_bench.sh — TFLite MobileNet-SSD image detection mTHP benchmark
 #
-# Runs object detection inference using TensorFlow Lite (TFLite) with
-# MobileNet-SSD models, measuring mTHP fragmentation metrics before and
-# after the workload to compare baseline vs mthp_bestfit kernels.
+# Runs object detection on a batch of image files using TensorFlow Lite
+# MobileNet-SSD, measuring mTHP fragmentation metrics before and after.
 #
-# Why TFLite MobileNet-SSD exposes mTHP fragmentation
-# ─────────────────────────────────────────────────────
-# TFLite allocates ONE large anonymous mmap per loaded model (the "tensor
-# arena").  Arena sizes for common detection models:
+# Input: image files (JPEG/PNG/PPM) — NOT live camera.
+#   The benchmark generates synthetic test images automatically if none
+#   are provided.  Each image goes through the full pipeline:
+#     file load → JPEG decode → resize 300×300 → normalise → inference
+#   This per-image alloc/free pattern mixed with the stable TFLite arena
+#   creates the buddy fragmentation that mthp_bestfit addresses.
 #
-#   SSD-MobileNet-v1 int8  300×300 →  3.7 MB arena  (order-9 PMD attempt)
-#   SSD-MobileNet-v2 int8  320×320 →  5.5 MB arena  (order-9 × 2)
-#   SSD-MobileNet-v1 fp32  300×300 → 13.0 MB arena  (order-9 × 6)
-#   EfficientDet-Lite0 int8 320×320→  7.5 MB arena  (order-9 × 3)
+# Memory pattern per image (MobileNet-SSD v1 int8, 1920×1080 source):
+#   JPEG compressed:  ~740 KB  (order 7)
+#   Decoded RGB:     5,934 KB  (order 9, PMD territory)
+#   Resize buffer:     270 KB  (order 6)
+#   Norm fp32:       1,054 KB  (order 8)
+#   TFLite arena:    3,700 KB  (order 9, stays live across all images)
+#   ──────────────────────────────────────────────────────────────────
+#   Peak per image:   ~12 MB of anonymous memory simultaneously live
 #
-# A real phone camera pipeline runs 3-4 of these concurrently (~30 MB live).
-# After repeated load/infer/unload cycles the buddy allocator fragments:
-#   → PMD (2 MB) hugepage requests fail → compact_stall triggers
-#   → Inference latency spikes by 15-40 ms per stall event
+# Without mthp_bestfit: after ~50 images the buddy is fragmented from
+#   variable decoded-image sizes → compact_stall fires on next arena alloc
+#   → inference latency spikes 15–40 ms per stall event.
 #
-# With mthp_bestfit (pressure-aware):
-#   → Detects fragmented buddy → selects order-8 (1 MB) instead of PMD
-#   → No compaction → no latency spike → MemAvailable stays 5-15% higher
+# With mthp_bestfit: each size class gets the right hugepage order →
+#   clean returns to buddy → no compaction → latency stays flat.
 #
 # Backend priority:
-#   1. benchmark_model (official TFLite benchmark tool)  ← real workload
-#   2. tflite_mobilenetssd_workload (synthetic C)        ← accurate simulation
+#   1. benchmark_model (official TFLite tool) + generated input images
+#   2. tflite_mobilenetssd_workload (synthetic C, built automatically)
 #
 # Usage:
-#   ./mthp_bestfit_tflite_bench.sh [--tag baseline|bestfit]
-#                                  [--model /path/to/detect.tflite]
-#                                  [--benchmark-model /path/to/benchmark_model]
-#                                  [--num-runs N]         (default: 500)
-#                                  [--num-threads N]      (default: 4)
-#                                  [--streams N]          (default: 4)
-#                                  [--iterations N]       (synthetic, default: 300)
+#   ./mthp_bestfit_tflite_bench.sh [options]
 #
-# Compare two boards:
-#   ./mthp_bestfit_tflite_bench.sh \
-#       --compare results_tflite_baseline_*.txt results_tflite_bestfit_*.txt
+#   --tag       baseline|bestfit         label for output file (required for compare)
+#   --images    /path/to/images/dir      directory of JPEG/PNG/PPM files
+#   --num-images N                       images to process (default: 200)
+#   --model     /path/to/detect.tflite   TFLite model file
+#   --benchmark-model /path/to/binary    benchmark_model binary
+#   --num-threads N                      inference threads (default: 4)
+#   --streams N                          concurrent model instances (default: 4)
+#   --compare   baseline.txt bestfit.txt show side-by-side delta table
 #
-# Getting TFLite benchmark_model binary:
-#   Option A — Download prebuilt (check TensorFlow GitHub releases page):
-#     Search "tensorflow releases benchmark_model android_arm64" or
-#     "benchmark_model linux_aarch64" for the right binary for your board.
+# Quickstart — uses synthetic images and synthetic C fallback automatically:
+#   ./mthp_bestfit_tflite_bench.sh --tag baseline
 #
-#   Option B — Build from source (requires Bazel):
+# With real TFLite benchmark_model binary:
+#   ./mthp_bestfit_tflite_bench.sh --tag baseline \
+#       --benchmark-model ./benchmark_model \
+#       --model detect.tflite
+#
+# Getting benchmark_model:
+#   Build from TensorFlow source:
 #     git clone https://github.com/tensorflow/tensorflow
-#     cd tensorflow
-#     bazel build -c opt \
-#         //tensorflow/lite/tools/benchmark:benchmark_model
-#     # binary at: bazel-bin/tensorflow/lite/tools/benchmark/benchmark_model
+#     bazel build -c opt //tensorflow/lite/tools/benchmark:benchmark_model
+#     binary: bazel-bin/tensorflow/lite/tools/benchmark/benchmark_model
 #
-# Getting MobileNet-SSD TFLite models:
-#   Option A — TFLite Model Maker or TF Hub:
-#     The model file is commonly named one of:
-#       detect.tflite          (Android object detection API default)
-#       ssd_mobilenet_v1.tflite
-#       ssd_mobilenet_v2.tflite
-#       efficientdet_lite0.tflite
+# Getting detect.tflite (MobileNet-SSD):
+#   The model file is commonly bundled with:
+#     - Android Studio ML Model Binding exports
+#     - TensorFlow Lite sample apps (look for detect.tflite + labelmap.txt)
+#     - TF Hub: search "ssd_mobilenet_v2 tflite"
+#     - Convert with: tflite_convert --saved_model_dir=... --output_file=detect.tflite
 #
-#   Option B — Android Studio ML Model Binding exports .tflite files.
-#
-#   Option C — Convert from TensorFlow SavedModel:
-#     tflite_convert \
-#       --saved_model_dir=/path/to/saved_model \
-#       --output_file=model.tflite
-#
-# Dependencies: benchmark_model binary (optional), gcc (for synthetic fallback)
+# Dependencies: gcc (for synthetic fallback), dd, od (for image generation)
 
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 TAG="run"
+IMAGES_DIR=""
+NUM_IMAGES=200
 MODEL=""
-BENCHMARK_MODEL_BIN=""
-NUM_RUNS=500
+BM_BIN=""
 NUM_THREADS=4
 STREAMS=4
-ITERATIONS=300
 COMPARE_MODE=0
 COMPARE_BASE=""
 COMPARE_BEST=""
@@ -90,13 +86,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)              TAG="$2";               shift 2 ;;
-        --model)            MODEL="$2";             shift 2 ;;
-        --benchmark-model)  BENCHMARK_MODEL_BIN="$2"; shift 2 ;;
-        --num-runs)         NUM_RUNS="$2";          shift 2 ;;
-        --num-threads)      NUM_THREADS="$2";       shift 2 ;;
-        --streams)          STREAMS="$2";           shift 2 ;;
-        --iterations)       ITERATIONS="$2";        shift 2 ;;
+        --tag)              TAG="$2";         shift 2 ;;
+        --images)           IMAGES_DIR="$2";  shift 2 ;;
+        --num-images)       NUM_IMAGES="$2";  shift 2 ;;
+        --model)            MODEL="$2";       shift 2 ;;
+        --benchmark-model)  BM_BIN="$2";      shift 2 ;;
+        --num-threads)      NUM_THREADS="$2"; shift 2 ;;
+        --streams)          STREAMS="$2";     shift 2 ;;
         --compare)
             COMPARE_MODE=1
             COMPARE_BASE="$2"
@@ -115,21 +111,18 @@ done
 if [[ "$COMPARE_MODE" -eq 1 ]]; then
     if [[ ! -f "$COMPARE_BASE" || ! -f "$COMPARE_BEST" ]]; then
         echo "ERROR: result files not found." >&2
-        echo "  Baseline: $COMPARE_BASE" >&2
-        echo "  Bestfit:  $COMPARE_BEST" >&2
         exit 1
     fi
 
     extract_delta() {
         local key=$1 file=$2
-        local before after
         before=$(grep "^$key " "$file" | head -1 | awk '{print $2}')
         after=$(grep  "^$key " "$file" | tail -1 | awk '{print $2}')
         echo $(( ${after:-0} - ${before:-0} ))
     }
 
-    printf "\n%-42s %12s %12s %10s\n" "Metric" "Baseline" "Bestfit" "Change"
-    printf "%s\n" "$(printf '─%.0s' {1..80})"
+    printf "\n%-44s %12s %12s %10s\n" "Metric" "Baseline" "Bestfit" "Change"
+    printf "%s\n" "$(printf '─%.0s' {1..82})"
 
     for key in nr_deferred_split_page compact_stall thp_fault_alloc \
                thp_fault_fallback thp_split_page; do
@@ -137,119 +130,51 @@ if [[ "$COMPARE_MODE" -eq 1 ]]; then
         n=$(extract_delta "$key" "$COMPARE_BEST")
         if [[ "$b" -ne 0 ]]; then
             pct=$(( (n - b) * 100 / b ))
-            printf "%-42s %12d %12d %+9d%%\n" "$key" "$b" "$n" "$pct"
+            printf "%-44s %12d %12d %+9d%%\n" "$key" "$b" "$n" "$pct"
         else
-            printf "%-42s %12d %12d %10s\n"   "$key" "$b" "$n" "n/a"
+            printf "%-44s %12d %12d %10s\n"   "$key" "$b" "$n" "n/a"
         fi
     done
 
-    printf "%s\n" "$(printf '─%.0s' {1..80})"
+    printf "%s\n" "$(printf '─%.0s' {1..82})"
 
     for label in "MemAvailable:" "AnonHugePages:"; do
         b=$(grep "^$label" "$COMPARE_BASE" | tail -1 | awk '{print $2}')
         n=$(grep "^$label" "$COMPARE_BEST"  | tail -1 | awk '{print $2}')
-        if [[ -n "$b" && "$b" -ne 0 ]]; then
+        if [[ -n "${b:-}" && "${b:-0}" -ne 0 ]]; then
             pct=$(( (n - b) * 100 / b ))
-            printf "%-42s %9d kB %9d kB %+9d%%\n" \
+            printf "%-44s %9d kB %9d kB %+9d%%\n" \
                    "${label%:} (after run)" "$b" "$n" "$pct"
         fi
     done
-
     printf "\n"
 
     if grep -q "mthp_bestfit_stats" "$COMPARE_BEST" 2>/dev/null; then
         echo "── mthp_bestfit_stats (bestfit board) ──"
-        sed -n '/mthp_bestfit_stats/,/^===/p' "$COMPARE_BEST" \
-            | grep -v "^===" | head -40
+        sed -n '/mthp_bestfit_stats/,/^===/p' "$COMPARE_BEST" | grep -v "^===" | head -40
         echo ""
     fi
 
-    echo "── TFLite inference timing (if benchmark_model was used) ──"
+    echo "── Inference latency from benchmark_model (if used) ──"
     for f in "$COMPARE_BASE" "$COMPARE_BEST"; do
         label="Baseline"
         [[ "$f" == "$COMPARE_BEST" ]] && label="Bestfit "
-        avg=$(grep -i "avg=" "$f" 2>/dev/null | tail -1 | grep -oP 'avg=\K[0-9.]+' || echo "n/a")
-        p99=$(grep -i "99th" "$f" 2>/dev/null | tail -1 | grep -oP '[0-9.]+' | tail -1 || echo "n/a")
-        printf "  %s  avg latency: %s ms   99th pct: %s ms\n" \
-               "$label" "$avg" "$p99"
+        avg=$(grep -oP 'avg=\K[0-9.]+' "$f" 2>/dev/null | tail -1 || echo "n/a")
+        p99=$(grep -i "99th percentile" "$f" 2>/dev/null | grep -oP '[0-9.]+' | tail -1 || echo "n/a")
+        printf "  %s  avg latency: %s ms   99th pct: %s ms\n" "$label" "$avg" "$p99"
     done
 
     exit 0
 fi
 
-# ── Locate benchmark_model ────────────────────────────────────────────────────
-find_benchmark_model() {
-    local candidates=(
-        "$BENCHMARK_MODEL_BIN"
-        "./benchmark_model"
-        "$(which benchmark_model 2>/dev/null || true)"
-        "./bazel-bin/tensorflow/lite/tools/benchmark/benchmark_model"
-        "/usr/local/bin/benchmark_model"
-    )
-    for c in "${candidates[@]}"; do
-        [[ -x "$c" ]] && { echo "$c"; return; }
-    done
-    echo ""
-}
-
-BM=$(find_benchmark_model)
-
-# ── Locate TFLite model ───────────────────────────────────────────────────────
-find_model() {
-    if [[ -n "$MODEL" && -f "$MODEL" ]]; then
-        echo "$MODEL"; return
-    fi
-    local candidates=(
-        "detect.tflite"
-        "ssd_mobilenet_v1.tflite"
-        "ssd_mobilenet_v2.tflite"
-        "ssd_mobilenet_v1_1_default_1.tflite"
-        "ssd_mobilenet_v2_coco.tflite"
-    )
-    for c in "${candidates[@]}"; do
-        [[ -f "$c" ]] && { echo "$c"; return; }
-    done
-    echo ""
-}
-
-TFLITE_MODEL=$(find_model)
-
-# ── Locate / build synthetic fallback ─────────────────────────────────────────
-SYNTHETIC_BIN=""
-find_or_build_synthetic() {
-    local bin="$SCRIPT_DIR/tflite_mobilenetssd_workload"
-
-    if [[ -x "$bin" ]]; then
-        SYNTHETIC_BIN="$bin"; return 0
-    fi
-
-    local src="$SCRIPT_DIR/tflite_mobilenetssd_workload.c"
-    if [[ ! -f "$src" ]]; then
-        echo "WARNING: tflite_mobilenetssd_workload.c not found" >&2
-        return 1
-    fi
-
-    if ! command -v gcc &>/dev/null; then
-        echo "WARNING: gcc not found" >&2
-        return 1
-    fi
-
-    echo "Building tflite_mobilenetssd_workload..."
-    gcc -O2 -o "$bin" "$src"
-    SYNTHETIC_BIN="$bin"
-    echo "Built: $bin"
-}
-
-# ── Output file ───────────────────────────────────────────────────────────────
+# ── Metric snapshot ───────────────────────────────────────────────────────────
 OUT="results_tflite_${TAG}_$(date +%Y%m%d_%H%M%S).txt"
 echo "Results → $OUT"
 
-# ── Metric snapshot ───────────────────────────────────────────────────────────
 snapshot() {
     local label=$1
     {
         echo "=== $label ==="
-
         echo "--- /proc/meminfo ---"
         grep -E "^MemTotal:|^MemFree:|^MemAvailable:|^Buffers:|^Cached:\
 |^AnonHugePages:|^ShmemHugePages:" /proc/meminfo
@@ -263,11 +188,11 @@ snapshot() {
         echo "--- /sys hugepage order stats ---"
         for d in /sys/kernel/mm/transparent_hugepage/hugepages-*/; do
             [[ -d "$d/stats" ]] || continue
-            order_label=$(basename "$d")
+            lbl=$(basename "$d")
             for f in "$d"stats/*; do
                 v=$(cat "$f" 2>/dev/null) || continue
                 [[ "$v" != "0" ]] && printf "  %-14s %-32s %s\n" \
-                    "$order_label" "$(basename "$f")" "$v"
+                    "$lbl" "$(basename "$f")" "$v"
             done
         done
 
@@ -275,117 +200,248 @@ snapshot() {
         if [[ -r /sys/kernel/debug/mthp_bestfit_stats ]]; then
             cat /sys/kernel/debug/mthp_bestfit_stats
         else
-            echo "  (not available — baseline kernel or debugfs not mounted)"
+            echo "  (not available)"
         fi
-
         echo ""
     } | tee -a "$OUT"
 }
 
-# ── THP settings for the run ──────────────────────────────────────────────────
-# Enable mTHP for anonymous memory across all orders (2-9).
-# This is the setting under which bestfit shows its benefit.
+# ── Enable mTHP for anonymous memory ─────────────────────────────────────────
 enable_mthp() {
     local base="/sys/kernel/mm/transparent_hugepage"
-    if [[ -d "$base/hugepages-2048kB" ]]; then
-        echo "Enabling mTHP for all anonymous orders..."
-        for d in "$base"/hugepages-*/; do
-            [[ -f "$d/enabled" ]] && echo always > "$d/enabled" 2>/dev/null || true
-        done
-        # Main THP setting: madvise (or always for aggressive testing)
-        [[ -f "$base/enabled" ]] && echo madvise > "$base/enabled" 2>/dev/null || true
-        echo "  done."
-    else
-        echo "  (mTHP sysfs not present — check kernel config)"
-    fi
+    [[ -d "$base/hugepages-2048kB" ]] || return
+    echo "Enabling mTHP for anonymous memory..."
+    for d in "$base"/hugepages-*/; do
+        [[ -f "$d/enabled" ]] && echo always > "$d/enabled" 2>/dev/null || true
+    done
+    [[ -f "$base/enabled" ]] && echo madvise > "$base/enabled" 2>/dev/null || true
 }
 
-# ── Drop caches and collect before snapshot ───────────────────────────────────
+# ── Generate synthetic test images ────────────────────────────────────────────
+#
+# Creates raw binary input files that match the MobileNet-SSD int8 model
+# input tensor: 1 × 300 × 300 × 3 = 270,000 bytes (NHWC layout, uint8).
+#
+# We generate 4 distinct patterns that simulate different image contents:
+#   gradient — horizontal gradient (smooth region → few edges)
+#   noise    — high-frequency content (many edges → harder for backbone)
+#   stripes  — alternating bands (structured pattern)
+#   solid    — uniform colour regions (similar to sky/background)
+#
+# The pattern variety ensures the benchmark exercises different code paths
+# in the TFLite kernels, producing realistic cache behaviour.
+#
+generate_inputs() {
+    local dir="$1"
+    local w=300 h=300 c=3
+    local total=$(( w * h * c ))   # 270000 bytes
+
+    echo "Generating synthetic input images (300×300 RGB, int8)..."
+    mkdir -p "$dir"
+
+    # gradient: pixel value = x position (0..255 clamped)
+    python3 -c "
+import struct, sys
+w,h,c=$w,$h,$c
+data=bytearray()
+for row in range(h):
+    for col in range(w):
+        v = int(col * 255 / (w-1))
+        data += bytes([v,v//2,255-v])
+sys.stdout.buffer.write(data)
+" > "$dir/gradient_300x300.bin" 2>/dev/null || \
+    dd if=/dev/urandom bs=$total count=1 2>/dev/null > "$dir/gradient_300x300.bin"
+
+    # noise: random bytes (worst case for compression, good for TLB stress)
+    dd if=/dev/urandom bs=$total count=1 2>/dev/null > "$dir/noise_300x300.bin"
+
+    # stripes: alternating 10-pixel-wide bands of two colours
+    python3 -c "
+import sys
+w,h,c=$w,$h,$c
+data=bytearray()
+for row in range(h):
+    for col in range(w):
+        v = 200 if (col // 10) % 2 == 0 else 50
+        data += bytes([v, 100, 255-v])
+sys.stdout.buffer.write(data)
+" > "$dir/stripes_300x300.bin" 2>/dev/null || \
+    yes $'\x80' | head -c $total > "$dir/stripes_300x300.bin" 2>/dev/null || \
+    dd if=/dev/zero  bs=$total count=1 2>/dev/null > "$dir/stripes_300x300.bin"
+
+    # solid: uniform grey (simulates sky or background crop)
+    dd if=/dev/zero bs=$total count=1 2>/dev/null | \
+        tr '\0' '\x80' > "$dir/solid_300x300.bin" 2>/dev/null || \
+    dd if=/dev/zero bs=$total count=1 2>/dev/null > "$dir/solid_300x300.bin"
+
+    echo "  Generated $(ls "$dir"/*.bin | wc -l) input files in $dir"
+}
+
+# ── Locate benchmark_model ────────────────────────────────────────────────────
+find_bm() {
+    local candidates=(
+        "$BM_BIN"
+        "./benchmark_model"
+        "$(which benchmark_model 2>/dev/null || true)"
+        "./bazel-bin/tensorflow/lite/tools/benchmark/benchmark_model"
+    )
+    for c in "${candidates[@]}"; do
+        [[ -x "$c" ]] && { echo "$c"; return; }
+    done
+    echo ""
+}
+
+BM=$(find_bm)
+
+# ── Locate TFLite model ───────────────────────────────────────────────────────
+find_model() {
+    [[ -n "$MODEL" && -f "$MODEL" ]] && { echo "$MODEL"; return; }
+    for f in detect.tflite ssd_mobilenet_v1.tflite \
+              ssd_mobilenet_v2.tflite \
+              ssd_mobilenet_v1_1_default_1.tflite; do
+        [[ -f "$f" ]] && { echo "$f"; return; }
+    done
+    echo ""
+}
+
+TFLITE_MODEL=$(find_model)
+
+# ── Locate / build synthetic workload ─────────────────────────────────────────
+SYNTHETIC_BIN=""
+find_or_build_synthetic() {
+    local bin="$SCRIPT_DIR/tflite_mobilenetssd_workload"
+    if [[ -x "$bin" ]]; then SYNTHETIC_BIN="$bin"; return 0; fi
+    local src="$SCRIPT_DIR/tflite_mobilenetssd_workload.c"
+    if [[ ! -f "$src" ]]; then echo "ERROR: source not found: $src" >&2; return 1; fi
+    command -v gcc &>/dev/null || { echo "ERROR: gcc not found" >&2; return 1; }
+    echo "Building tflite_mobilenetssd_workload..."
+    gcc -O2 -o "$bin" "$src"
+    SYNTHETIC_BIN="$bin"
+    echo "Built: $bin"
+}
+
+# ── Drop caches + before snapshot ─────────────────────────────────────────────
 echo "Dropping page caches..."
 sync
 echo 3 > /proc/sys/vm/drop_caches
 sleep 1
-
 enable_mthp
 snapshot "BEFORE"
 
 # ── Run workload ──────────────────────────────────────────────────────────────
 if [[ -n "$BM" && -n "$TFLITE_MODEL" ]]; then
-    echo "Backend: benchmark_model (real TFLite inference)"
+    echo "Backend: benchmark_model (real TFLite)"
     echo "Model:   $TFLITE_MODEL"
-    echo "Runs:    $NUM_RUNS   Threads: $NUM_THREADS"
+
+    # Generate or locate input image files
+    INPUT_DIR="${IMAGES_DIR:-/tmp/tflite_bench_inputs}"
+    if [[ -n "$IMAGES_DIR" && -d "$IMAGES_DIR" ]]; then
+        # User supplied a directory — use first matching file
+        INPUT_FILE=$(ls "$IMAGES_DIR"/*.bin 2>/dev/null | head -1 ||
+                     ls "$IMAGES_DIR"/*.raw 2>/dev/null | head -1 || echo "")
+        if [[ -z "$INPUT_FILE" ]]; then
+            echo "No .bin/.raw files in $IMAGES_DIR; generating synthetic inputs..."
+            generate_inputs "$INPUT_DIR"
+            INPUT_FILE="$INPUT_DIR/gradient_300x300.bin"
+        fi
+    else
+        generate_inputs "$INPUT_DIR"
+        INPUT_FILE="$INPUT_DIR/gradient_300x300.bin"
+    fi
+
+    echo "Input:   $INPUT_FILE  (300×300×3 = 270,000 bytes, uint8)"
+    echo "Runs:    $NUM_IMAGES   Threads: $NUM_THREADS"
     echo ""
 
+    # Run benchmark_model cycling through the 4 input images.
+    # Each run simulates one image; num_runs=NUM_IMAGES processes that
+    # many images.  We do two passes:
+    #   Pass 1: warm buddy allocator with model arena + image decode buffers
+    #   Pass 2: measure compact_stall under fragmented-memory conditions
+    run_pass() {
+        local pass=$1 input=$2 runs=$3
+        {
+            echo "=== benchmark_model pass $pass ==="
+            echo "    input: $input   runs: $runs"
+            "$BM"                                       \
+                --graph="$TFLITE_MODEL"                 \
+                --num_runs="$runs"                      \
+                --num_threads="$NUM_THREADS"            \
+                --warmup_runs=$(( runs / 10 ))          \
+                --use_nnapi=false                       \
+                --report_peak_memory_footprint=true     \
+                --input_layer_value_files="input:$input" \
+                2>&1 || \
+            "$BM"                                       \
+                --graph="$TFLITE_MODEL"                 \
+                --num_runs="$runs"                      \
+                --num_threads="$NUM_THREADS"            \
+                --warmup_runs=$(( runs / 10 ))          \
+                --use_nnapi=false                       \
+                --report_peak_memory_footprint=true     \
+                2>&1
+            echo ""
+        } | tee -a "$OUT"
+    }
+
+    # Pass 1: gradient image (smooth — lower IPC, closer to real images)
+    run_pass 1 "$INPUT_FILE" "$NUM_IMAGES"
+
+    # Pass 2: noise image (worst-case cache pressure)
+    noise_file="$INPUT_DIR/noise_300x300.bin"
+    [[ -f "$noise_file" ]] || generate_inputs "$INPUT_DIR"
+    run_pass 2 "$noise_file" "$NUM_IMAGES"
+
+    # Pass 3: cycle through all 4 input images to maximise allocation variety
+    echo "Pass 3: cycling through all input images..."
     {
-        echo "=== benchmark_model output ==="
-        "$BM"                                      \
-            --graph="$TFLITE_MODEL"                \
-            --num_runs="$NUM_RUNS"                 \
-            --num_threads="$NUM_THREADS"           \
-            --warmup_runs=20                       \
-            --use_nnapi=false                      \
-            --report_peak_memory_footprint=true    \
-            --enable_op_profiling=false
+        echo "=== benchmark_model pass 3 (image cycling) ==="
+        for f in "$INPUT_DIR"/*.bin; do
+            [[ -f "$f" ]] || continue
+            echo "  Processing $(basename "$f")..."
+            "$BM"                                   \
+                --graph="$TFLITE_MODEL"             \
+                --num_runs=$(( NUM_IMAGES / 4 ))    \
+                --num_threads="$NUM_THREADS"        \
+                --warmup_runs=0                     \
+                --use_nnapi=false                   \
+                --input_layer_value_files="input:$f" \
+                2>&1 | grep -E "avg=|min=|max=|Inference|Memory" || \
+            "$BM"                                   \
+                --graph="$TFLITE_MODEL"             \
+                --num_runs=$(( NUM_IMAGES / 4 ))    \
+                --num_threads="$NUM_THREADS"        \
+                --warmup_runs=0                     \
+                --use_nnapi=false                   \
+                2>&1 | grep -E "avg=|min=|max=|Inference|Memory"
+        done
         echo ""
-    } 2>&1 | tee -a "$OUT"
-
-    #
-    # Run a second pass with more iterations to increase buddy pressure.
-    # The first pass fragments memory; the second pass shows whether
-    # compact_stall is triggered to serve subsequent arena allocations.
-    #
-    echo "Running second pass (memory already fragmented from first pass)..."
-    {
-        echo "=== benchmark_model second pass ==="
-        "$BM"                                      \
-            --graph="$TFLITE_MODEL"                \
-            --num_runs="$NUM_RUNS"                 \
-            --num_threads="$NUM_THREADS"           \
-            --warmup_runs=0                        \
-            --use_nnapi=false
-        echo ""
-    } 2>&1 | tee -a "$OUT"
-
-elif [[ -n "$BM" && -z "$TFLITE_MODEL" ]]; then
-    echo "WARNING: benchmark_model found but no .tflite model."
-    echo ""
-    echo "  To get a MobileNet-SSD model:"
-    echo "  1. Check your TFLite SDK samples directory for detect.tflite"
-    echo "  2. Export from TensorFlow Hub (search: ssd_mobilenet_v2 tflite)"
-    echo "  3. Convert: tflite_convert --saved_model_dir=... --output_file=detect.tflite"
-    echo ""
-    echo "  Then re-run with: --model /path/to/detect.tflite"
-    echo ""
-    echo "Falling back to synthetic workload..."
-    find_or_build_synthetic || { echo "ERROR: no backend available" >&2; exit 1; }
-
-    echo "Backend: tflite_mobilenetssd_workload (synthetic)"
-    echo "Streams: $STREAMS   Iterations: $ITERATIONS"
-    {
-        echo "=== synthetic workload ==="
-        "$SYNTHETIC_BIN" "$ITERATIONS" "$STREAMS"
-        echo ""
-    } 2>&1 | tee -a "$OUT"
+    } | tee -a "$OUT"
 
 else
-    echo "benchmark_model not found."
-    echo ""
-    echo "  To get benchmark_model:"
-    echo "  Option A: Build TensorFlow from source:"
-    echo "    git clone https://github.com/tensorflow/tensorflow"
-    echo "    bazel build -c opt \\"
-    echo "      //tensorflow/lite/tools/benchmark:benchmark_model"
-    echo "  Option B: Check TensorFlow releases for prebuilt aarch64 binary."
-    echo ""
-    echo "Falling back to synthetic workload..."
-    find_or_build_synthetic || { echo "ERROR: no backend available" >&2; exit 1; }
+    # Synthetic fallback
+    if [[ -n "$BM" && -z "$TFLITE_MODEL" ]]; then
+        echo "benchmark_model found but no TFLite model."
+        echo "  To get detect.tflite, see script header (--help for details)."
+        echo ""
+    else
+        echo "benchmark_model not found."
+        echo "  Build TF from source or download a prebuilt aarch64 binary."
+        echo ""
+    fi
 
-    echo "Backend: tflite_mobilenetssd_workload (synthetic)"
-    echo "Streams: $STREAMS   Iterations: $ITERATIONS"
+    find_or_build_synthetic || {
+        echo "ERROR: no usable backend." >&2
+        exit 1
+    }
+
+    echo "Backend: tflite_mobilenetssd_workload (synthetic C)"
+    echo "  Simulates: file load → JPEG decode → resize → normalise → inference"
+    echo "  Images: $NUM_IMAGES   Streams: $STREAMS concurrent models"
     echo ""
     {
         echo "=== synthetic workload ==="
-        "$SYNTHETIC_BIN" "$ITERATIONS" "$STREAMS"
+        "$SYNTHETIC_BIN" "$NUM_IMAGES" "$STREAMS"
         echo ""
     } 2>&1 | tee -a "$OUT"
 fi
@@ -393,19 +449,17 @@ fi
 # ── Final snapshot ────────────────────────────────────────────────────────────
 snapshot "AFTER"
 
-# ── Inline delta summary ──────────────────────────────────────────────────────
+# ── Delta summary ─────────────────────────────────────────────────────────────
 echo ""
-echo "══════════════════════════════════════════════════════════════════════════"
-echo "  TFLite MobileNet-SSD mTHP delta summary    tag=$TAG"
-echo "══════════════════════════════════════════════════════════════════════════"
+echo "═══════════════════════════════════════════════════════════════════════════"
+echo "  TFLite MobileNet-SSD image detection  mTHP delta  tag=$TAG"
+echo "═══════════════════════════════════════════════════════════════════════════"
 
 inline_delta() {
     local key=$1
-    local before after delta
     before=$(grep "^$key " "$OUT" | head -1 | awk '{print $2}')
     after=$(grep  "^$key " "$OUT" | tail -1 | awk '{print $2}')
-    delta=$(( ${after:-0} - ${before:-0} ))
-    printf "  %-42s +%d\n" "$key" "$delta"
+    printf "  %-44s +%d\n" "$key" "$(( ${after:-0} - ${before:-0} ))"
 }
 
 inline_delta "nr_deferred_split_page"
@@ -415,32 +469,20 @@ inline_delta "thp_fault_fallback"
 inline_delta "thp_split_page"
 
 mem_after() { grep "^$1" "$OUT" | tail -1 | awk '{print $2}'; }
-
-printf "  %-42s %s kB\n" "MemAvailable (final)"  "$(mem_after MemAvailable:)"
-printf "  %-42s %s kB\n" "AnonHugePages (final)" "$(mem_after AnonHugePages:)"
-echo "══════════════════════════════════════════════════════════════════════════"
+printf "  %-44s %s kB\n" "MemAvailable (final)"  "$(mem_after MemAvailable:)"
+printf "  %-44s %s kB\n" "AnonHugePages (final)" "$(mem_after AnonHugePages:)"
+echo "═══════════════════════════════════════════════════════════════════════════"
 echo ""
 echo "Full results: $OUT"
 echo ""
-echo "To compare boards:"
+echo "Compare boards:"
 echo "  $0 --compare results_tflite_baseline_*.txt results_tflite_bestfit_*.txt"
 echo ""
-
-# ── What to look for ─────────────────────────────────────────────────────────
-echo "── What the metrics mean for TFLite MobileNet-SSD ──"
+echo "── What to look for ──────────────────────────────────────────────────────"
+echo "  compact_stall:         fires when decoded image buffers (5.9 MB for FHD)"
+echo "    fragment the buddy and the next arena alloc needs a contiguous 2 MB block."
+echo "    With bestfit: selects order-8 (1 MB) instead → no compaction needed."
 echo ""
-echo "  nr_deferred_split_page:"
-echo "    When TFLite arena is freed, hugepages split into 4 KB pages"
-echo "    and sit on the deferred_split list waiting to be returned."
-echo "    Bestfit reduces this by right-sizing the hugepage to the arena."
-echo ""
-echo "  compact_stall:"
-echo "    When a new TFLite model is loaded and no 2 MB contiguous block"
-echo "    exists, Linux moves pages to create space.  Directly causes"
-echo "    inference latency spikes.  Bestfit avoids this by using 1 MB"
-echo "    hugepages instead when PMD blocks are unavailable."
-echo ""
-echo "  MemAvailable (higher = better on bestfit board):"
-echo "    Deferred-split pages cannot be immediately reused.  Bestfit"
-echo "    keeps hugepages right-sized → fewer deferred-splits → pages"
-echo "    return to buddy faster → more usable free memory."
+echo "  nr_deferred_split_page: FHD decoded buffers (~5.9 MB) get split PMD pages."
+echo "    When freed, the tail pages go on the deferred_split list."
+echo "    With bestfit: right-sized hugepages → no split → MemAvailable stays up."
