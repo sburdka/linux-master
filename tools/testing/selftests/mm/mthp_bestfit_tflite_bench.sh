@@ -185,6 +185,14 @@ snapshot() {
 |^thp_fault_fallback_charge|^thp_split_page|^thp_split_page_failed\
 |^thp_zero_page_alloc$|^thp_zero_page_alloc_failed$" /proc/vmstat
 
+        # /proc/buddyinfo shows free blocks at each order.
+        # Order 9 = PMD (2 MB blocks). When this count drops to <10 during
+        # the workload, compact_stall will fire on the next THP request.
+        echo "--- /proc/buddyinfo (free blocks per order) ---"
+        cat /proc/buddyinfo
+        echo "    ^order: 0    1    2    3    4    5    6    7    8    9   10"
+        echo "    order 9 = PMD (2 MB). Count < 10 → compact_stall risk"
+
         echo "--- /sys hugepage order stats ---"
         for d in /sys/kernel/mm/transparent_hugepage/hugepages-*/; do
             [[ -d "$d/stats" ]] || continue
@@ -320,6 +328,27 @@ find_or_build_synthetic() {
     echo "Built: $bin"
 }
 
+# ── Build fragmenter if source available ──────────────────────────────────────
+FRAGMENTER_BIN=""
+FRAGMENTER_PID=""
+
+build_fragmenter() {
+    local bin="$SCRIPT_DIR/mm_fragmenter"
+    local src="$SCRIPT_DIR/mm_fragmenter.c"
+    [[ -x "$bin" ]] && { FRAGMENTER_BIN="$bin"; return; }
+    [[ -f "$src" ]] && command -v gcc &>/dev/null && {
+        echo "Building mm_fragmenter..."
+        gcc -O2 -o "$bin" "$src"
+        FRAGMENTER_BIN="$bin"
+    }
+}
+build_fragmenter
+
+# ── Build continuous monitor ───────────────────────────────────────────────────
+MONITOR_BIN="$SCRIPT_DIR/mthp_monitor.sh"
+MONITOR_PID=""
+METRICS_CSV=""
+
 # ── Drop caches + before snapshot ─────────────────────────────────────────────
 echo "Dropping page caches..."
 sync
@@ -327,6 +356,48 @@ echo 3 > /proc/sys/vm/drop_caches
 sleep 1
 enable_mthp
 snapshot "BEFORE"
+
+# ── Pre-fragment buddy allocator ───────────────────────────────────────────────
+# Simulate a real device after hours of use: allocate sub-PMD buffers of
+# varied sizes, free alternating ones to leave "swiss cheese" fragmentation.
+# This drives order-9 (PMD) free count down, making compact_stall measurable.
+if [[ -n "$FRAGMENTER_BIN" ]]; then
+    echo ""
+    echo "Pre-fragmenting buddy allocator (simulates long-running device)..."
+    echo "  This forces compact_stall to be measurable even on freshly booted systems."
+    # Use 20% of MemFree for fragmentation
+    MEMFREE_MB=$(awk '/^MemFree:/{print int($2/1024)}' /proc/meminfo)
+    FRAG_MB=$(( MEMFREE_MB / 5 ))
+    [[ $FRAG_MB -lt 64  ]] && FRAG_MB=64
+    [[ $FRAG_MB -gt 512 ]] && FRAG_MB=512
+    echo "  Target: ${FRAG_MB} MB (20% of MemFree=${MEMFREE_MB} MB)"
+    "$FRAGMENTER_BIN" "$FRAG_MB" hold &
+    FRAGMENTER_PID=$!
+    sleep 3  # let fragmenter fully allocate before workload starts
+    PMD_NOW=$(awk '
+        /zone/ {
+            for (i=1;i<=NF;i++) if ($i=="zone") { s=i+2; break }
+            total += $(s+10)
+        }
+        END { print total+0 }' /proc/buddyinfo 2>/dev/null || echo "?")
+    echo "  PMD-sized (2 MB) free blocks now: $PMD_NOW"
+    echo ""
+fi
+
+# ── Start continuous metric monitor ───────────────────────────────────────────
+METRICS_CSV="metrics_tflite_${TAG}_$(date +%Y%m%d_%H%M%S).csv"
+if [[ -x "$MONITOR_BIN" ]]; then
+    echo "Starting continuous monitor → $METRICS_CSV"
+    bash "$MONITOR_BIN" --out "$METRICS_CSV" &
+    MONITOR_PID=$!
+fi
+
+# ── Cleanup on exit ───────────────────────────────────────────────────────────
+cleanup() {
+    [[ -n "$MONITOR_PID"    ]] && kill "$MONITOR_PID"    2>/dev/null || true
+    [[ -n "$FRAGMENTER_PID" ]] && kill "$FRAGMENTER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # ── Run workload ──────────────────────────────────────────────────────────────
 if [[ -n "$BM" && -n "$TFLITE_MODEL" ]]; then
@@ -445,6 +516,10 @@ else
         echo ""
     } 2>&1 | tee -a "$OUT"
 fi
+
+# ── Stop monitor and fragmenter ───────────────────────────────────────────────
+[[ -n "$MONITOR_PID"    ]] && { kill "$MONITOR_PID"    2>/dev/null; wait "$MONITOR_PID"    2>/dev/null || true; MONITOR_PID=""; }
+[[ -n "$FRAGMENTER_PID" ]] && { kill "$FRAGMENTER_PID" 2>/dev/null; wait "$FRAGMENTER_PID" 2>/dev/null || true; FRAGMENTER_PID=""; }
 
 # ── Final snapshot ────────────────────────────────────────────────────────────
 snapshot "AFTER"
