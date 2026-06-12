@@ -1,35 +1,19 @@
-# SPDX-License-Identifier: GPL-2.0
-#
-# mthp_bestfit_mod — Makefile
-#
-# On-device build (RPi5, kernel headers installed):
-#   make
-#
-# Cross-compile for RPi5 from x86 host:
-#   make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KDIR=/path/to/rpi-linux
-#
-# In-tree build (inside kernel source):
-#   obj-$(CONFIG_MTHP_BESTFIT_MOD) += mthp_bestfit_mod.o
-#   (add to mm/Makefile and mm/Kconfig)
-
-obj-m := mthp_bestfit_mod.o
+# Build both modules against a configured GKI 6.12 tree.
+# Note: mthp_bestfit resolves mthp_monitor_get_sysinfo at runtime via
+# symbol_get() (string lookup), so no KBUILD_EXTRA_SYMBOLS is required
+# and either module builds independently.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
+ARCH ?= arm64
+LLVM ?= 1
+SUBDIRS := mthp_monitor mthp_bestfit
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	@for d in $(SUBDIRS); do \
+		$(MAKE) -C $(KDIR) M=$(CURDIR)/$$d ARCH=$(ARCH) LLVM=$(LLVM) modules || exit 1; \
+	done
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-
-install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
-	depmod -a
-
-# RPi5 cross-compile convenience target
-# Requires: sudo apt install gcc-aarch64-linux-gnu
-# Set KDIR to your RPi Linux source tree with .config for bcm2712
-rpi5:
-	$(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-		KDIR=$(KDIR) M=$(PWD) modules
+	@for d in $(SUBDIRS); do \
+		$(MAKE) -C $(KDIR) M=$(CURDIR)/$$d ARCH=$(ARCH) LLVM=$(LLVM) clean; \
+	done
